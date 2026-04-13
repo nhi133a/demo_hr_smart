@@ -1,0 +1,10 @@
+streamlit
+boto3
+openai
+pymongo
+PyPDF2
+python-dotenv
+PyMuPDF
+elevenlabs
+pydub
+ffmpeg
