@@ -5,14 +5,11 @@ from pymongo import MongoClient
 
 load_dotenv()
 
-# FIX 1: thêm tlsCAFile=certifi.where() để fix lỗi SSL trên Windows
-client = MongoClient(os.getenv("MONGO_URI"), tlsCAFile=certifi.where())
-
-db = client["aws_rag_db"]
+client     = MongoClient(os.getenv("MONGO_URI"), tlsCAFile=certifi.where())
+db         = client["aws_rag_db"]
 collection = db["documents"]
 
 
-# FIX 2: xóa định nghĩa insert_chunks trùng lặp, chỉ giữ version có source_name
 def insert_chunks(chunks_with_embeddings, source_name):
     docs = [
         {"content": chunk, "embedding": embedding, "source": source_name}
@@ -21,19 +18,24 @@ def insert_chunks(chunks_with_embeddings, source_name):
     collection.insert_many(docs)
 
 
-def search_similar_chunks(query_embedding, k=10):
-    pipeline = [
-        {
-            "$vectorSearch": {
-                "index": "vector_index",
-                "path": "embedding",
-                "queryVector": query_embedding,
-                "numCandidates": 100,
-                "limit": k
-            }
-        }
-    ]
-    return list(collection.aggregate(pipeline))
+def search_similar_chunks(query_embedding, k=10, source_filter: str = None):
+    """
+    FIX: Thêm source_filter để chỉ search trong 1 CV cụ thể.
+    Khi source_filter=None → search toàn bộ (hành vi cũ).
+    """
+    vector_search = {
+        "index":        "vector_index",
+        "path":         "embedding",
+        "queryVector":  query_embedding,
+        "numCandidates": 100,
+        "limit":        k,
+    }
+
+    # Chỉ filter khi có source_filter
+    if source_filter:
+        vector_search["filter"] = {"source": {"$eq": source_filter}}
+
+    return list(collection.aggregate([{"$vectorSearch": vector_search}]))
 
 
 def delete_all_documents():

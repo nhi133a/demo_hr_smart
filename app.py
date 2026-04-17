@@ -29,17 +29,66 @@ st.title("🚀 IAcine HR Power Tool – CV RAG Analyzer")
 
 
 # =====================================================
-# SIDEBAR — CV Library Management (GIỮ NGUYÊN GỐC)
+# FIELDS DEFINITION
+# =====================================================
+
+fields = {
+    "Name":           "What is the candidate's name?",
+    "Title":          "What is the candidate's current title?",
+    "Certifications": "Which certifications does the candidate hold?",
+    "Passion":        "Provide the candidate's personal summary/passion statement.",
+    "Education":      "What is the candidate's academic background?",
+    "Experience":     "What professional experiences does the candidate have?",
+    "Skills & Tools": "List key skills and tools mentioned.",
+    "Languages":      "Which languages does the candidate speak?",
+    "Contact":        "How can we contact the candidate?",
+    "Location":       "Where is the candidate based?"
+}
+
+
+# =====================================================
+# SESSION STATE — khởi tạo lần đầu
+# =====================================================
+
+for key in fields:
+    if key not in st.session_state:
+        st.session_state[key] = ""
+
+if "chat_history"    not in st.session_state: st.session_state["chat_history"]    = []
+if "jd_matches"      not in st.session_state: st.session_state["jd_matches"]      = []
+if "last_active_cv"  not in st.session_state: st.session_state["last_active_cv"]  = None
+
+
+# =====================================================
+# HELPER — Reset toàn bộ state khi đổi CV
+# =====================================================
+
+def _reset_cv_state():
+    """Xóa sạch profile, matching results, chat khi chuyển sang CV khác"""
+    for key in fields:
+        st.session_state[key] = ""
+    st.session_state["jd_matches"]  = []
+    st.session_state["chat_history"] = []
+
+
+# =====================================================
+# SIDEBAR — CV Library Management
 # =====================================================
 
 st.sidebar.header("📂 CV Library Management")
 
 sources = get_distinct_sources()
+
 if sources:
     to_delete = st.sidebar.selectbox("🗑️ Delete a CV", sources)
     if st.sidebar.button("Delete CV"):
         deleted = delete_documents_by_source(to_delete)
         st.sidebar.success(f"✅ Removed {deleted} chunks from {to_delete}")
+        # Nếu xóa CV đang active → reset state
+        if to_delete == st.session_state["last_active_cv"]:
+            st.session_state["last_active_cv"] = None
+            _reset_cv_state()
+        st.rerun()
 else:
     st.sidebar.info("ℹ️ No CVs indexed yet.")
 
@@ -55,11 +104,25 @@ if uploaded:
     with st.spinner("🔍 Indexing CV…"):
         n = process_multiple_pdfs([uploaded])
     st.sidebar.success(f"✅ Indexed {n} chunks from the CV")
+    st.rerun()  # Reload để sources list cập nhật ngay
+
+# Reload sources sau khi upload
+sources = get_distinct_sources()
 
 active_cv = None
 if sources:
     active_cv = st.sidebar.selectbox("🎯 Select CV to analyze", sources)
     st.sidebar.info(f"Analyzing: **{active_cv}**")
+
+    # =====================================================
+    # FIX CHÍNH: Reset state khi user chọn CV khác
+    # Đây là nguyên nhân gốc rễ gây lẫn lộn dữ liệu
+    # =====================================================
+    if st.session_state["last_active_cv"] != active_cv:
+        st.session_state["last_active_cv"] = active_cv
+        _reset_cv_state()
+        st.rerun()  # Force re-render ngay để bảng hiển thị trắng
+
 else:
     st.sidebar.info("Upload and index a CV to begin")
 
@@ -72,7 +135,7 @@ st.sidebar.markdown("---")
 st.sidebar.header("📋 JD Management")
 
 try:
-    jd_db = get_jd_store()
+    jd_db    = get_jd_store()
     jd_count = jd_db._collection.count()
     st.sidebar.markdown(f"**📦 Total JD chunks:** `{jd_count}`")
 except Exception:
@@ -94,32 +157,8 @@ if st.sidebar.button("🔄 Index JDs"):
 
 
 # =====================================================
-# MAIN — Session state
+# GENERATE PROFILE — dùng source_filter = active_cv
 # =====================================================
-
-fields = {
-    "Name":           "What is the candidate's name?",
-    "Title":          "What is the candidate's current title?",
-    "Certifications": "Which certifications does the candidate hold?",
-    "Passion":        "Provide the candidate's personal summary/passion statement.",
-    "Education":      "What is the candidate's academic background?",
-    "Experience":     "What professional experiences does the candidate have?",
-    "Skills & Tools": "List key skills and tools mentioned.",
-    "Languages":      "Which languages does the candidate speak?",
-    "Contact":        "How can we contact the candidate?",
-    "Location":       "Where is the candidate based?"
-}
-
-for key in fields:
-    if key not in st.session_state:
-        st.session_state[key] = ""
-
-if "chat_history" not in st.session_state:
-    st.session_state["chat_history"] = []
-
-if "jd_matches" not in st.session_state:
-    st.session_state["jd_matches"] = []
-
 
 def generate_full_profile():
     if not active_cv:
@@ -129,10 +168,10 @@ def generate_full_profile():
     for label, question in fields.items():
         if label == "Experience":
             prompt = "Please answer concisely and list *all* professional experiences mentioned in the CV."
-            ans = answer_question(prompt, k=10)
+            ans = answer_question(prompt, k=10, source_filter=active_cv)  # FIX
         else:
             prompt = f"Please answer concisely: {question}"
-            ans = answer_question(prompt)
+            ans = answer_question(prompt, source_filter=active_cv)        # FIX
 
         if "Aucun contenu pertinent" in ans or "not specified" in ans:
             ans = "❌ Not specified in the CV."
@@ -148,11 +187,19 @@ col_profile, col_chat = st.columns([2, 1])
 
 with col_profile:
 
-    # --- Profile Snapshot (GIỮ NGUYÊN GỐC) ---
+    # --- Profile Snapshot ---
     st.header("🎯 Candidate Profile Snapshot")
+
+    # Hiện tên CV đang active dưới header để tránh nhầm lẫn
+    if active_cv:
+        st.caption(f"📄 CV đang phân tích: **{active_cv}**")
+    else:
+        st.caption("⚠️ Chưa chọn CV")
+
     st.button("🤖 Generate Full Profile", on_click=generate_full_profile)
+
     data = {label: st.session_state[label] or "–" for label in fields}
-    df = pd.DataFrame.from_dict(data, orient="index", columns=["Value"])
+    df   = pd.DataFrame.from_dict(data, orient="index", columns=["Value"])
     st.table(df)
 
     # --- JD Matching ---
@@ -187,12 +234,10 @@ with col_profile:
                         except Exception as e:
                             st.error(f"❌ Matching error: {e}")
 
-    # Hiển thị kết quả
+    # --- Hiển thị kết quả matching ---
     if st.session_state["jd_matches"]:
-
-        # --- CV Profile summary (từ resume_processor) ---
         first_match = st.session_state["jd_matches"][0]
-        cv_profile = first_match.get("cv_profile", {})
+        cv_profile  = first_match.get("cv_profile", {})
 
         if cv_profile:
             st.markdown("**🧠 CV Profile (Auto-detected)**")
@@ -202,18 +247,15 @@ with col_profile:
             p3.metric("Skills",     f"{cv_profile.get('total_skills', 0)} found")
             p4.metric("Fit",        cv_profile.get("fit_assessment", "–"))
 
-            # Skill breakdown theo domain
             breakdown = cv_profile.get("skill_breakdown", {})
             if breakdown:
                 st.caption("Skill domains: " + " · ".join(
                     f"**{cat}** ({cnt})" for cat, cnt in breakdown.items()
                 ))
-
             st.markdown("---")
 
-        # --- Từng JD result ---
         for i, match in enumerate(st.session_state["jd_matches"]):
-            ev = match["evaluation"]
+            ev    = match["evaluation"]
             score = ev.get("score", 0)
             badge = "🟢" if score >= 70 else "🟡" if score >= 50 else "🔴"
 
@@ -221,17 +263,15 @@ with col_profile:
                 f"{badge} #{i+1}  {match['jd_title']}  —  {score}/100",
                 expanded=(i == 0)
             ):
-                # Score breakdown
                 st.markdown("**📊 Score Breakdown**")
                 b1, b2, b3, b4 = st.columns(4)
-                b1.metric("Technical",   f"{ev.get('technical_score',   '–')}/40")
-                b2.metric("Experience",  f"{ev.get('experience_score',  '–')}/30")
-                b3.metric("Education",   f"{ev.get('education_score',   '–')}/20")
-                b4.metric("Soft Skills", f"{ev.get('softskill_score',   '–')}/10")
+                b1.metric("Technical",   f"{ev.get('technical_score',  '–')}/40")
+                b2.metric("Experience",  f"{ev.get('experience_score', '–')}/30")
+                b3.metric("Education",   f"{ev.get('education_score',  '–')}/20")
+                b4.metric("Soft Skills", f"{ev.get('softskill_score',  '–')}/10")
 
                 st.markdown("---")
 
-                # Skills
                 col_a, col_b = st.columns(2)
                 with col_a:
                     st.markdown("**✅ Matched Skills**")
@@ -254,8 +294,16 @@ with col_profile:
                 )
 
 
+# =====================================================
+# CHAT — dùng source_filter = active_cv
+# =====================================================
+
 with col_chat:
     st.header("💬 Freeform RAG Chat")
+
+    if active_cv:
+        st.caption(f"💬 Đang chat về: **{active_cv}**")
+
     for role, msg in st.session_state["chat_history"]:
         st.chat_message(role).write(msg)
 
@@ -263,9 +311,12 @@ with col_chat:
     if user_input:
         st.chat_message("user").write(user_input)
         with st.spinner("🔍 Searching & Generating…"):
-            reply = answer_question(f"Please answer concisely: {user_input}")
+            reply = answer_question(
+                f"Please answer concisely: {user_input}",
+                source_filter=active_cv    # FIX
+            )
             if "Aucun contenu pertinent" in reply or "not specified" in reply:
                 reply = "❌ Not specified in the CV."
         st.chat_message("assistant").write(reply)
-        st.session_state["chat_history"].append(("user", user_input))
+        st.session_state["chat_history"].append(("user",      user_input))
         st.session_state["chat_history"].append(("assistant", reply))
