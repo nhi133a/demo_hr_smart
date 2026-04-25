@@ -1,43 +1,46 @@
-"""
-cv_semantic_chunker.py
-======================
-Pipeline chunking CV/PDF hoàn chỉnh:
-
-  1. Extract text từ PDF   (pdf_utils → PyMuPDF)
-  2. Detect section headers (pdf_utils → group_by_section)
-  3. Semantic chunking     (LangChain SemanticChunker + sentence-transformers)
-  4. Đóng gói kết quả      (List[Dict] tương thích RAG / vector store)
-
-Cài đặt:
-    pip install pymupdf langchain-experimental sentence-transformers
-
-Dùng nhanh:
-    python cv_semantic_chunker.py <cv.pdf>
-"""
-
-# ── stdlib ────────────────────────────────────────────────────────────────────
 import re
 import html
-import sys
-from collections import Counter
-from typing import List, Dict, Literal
+import tempfile
+import os
+from pathlib import Path
+from typing import List, Dict, Optional
 
-# ── third-party ───────────────────────────────────────────────────────────────
-import fitz  # PyMuPDF
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.datamodel.base_models import InputFormat
+from docling_core.transforms.chunker.hierarchical_chunker import HierarchicalChunker
 
-from langchain_experimental.text_splitter import SemanticChunker
+from semantic_chunking import (
+    normalize_headings_semantic,
+    merge_semantically_similar_chunks,
+    debug_heading_scores,       # dùng trong CLI --test-heading
+    save_embedding_cache,       # dùng trong CLI --save-cache
+)
+
 try:
-    from langchain_huggingface import HuggingFaceEmbeddings          # langchain-huggingface >= 0.1
+    from bedrock_llm import extract_skills_from_experience
+    SKILL_EXTRACTION_AVAILABLE = True
 except ImportError:
-    from langchain_community.embeddings import HuggingFaceEmbeddings  # fallback cũ
+    SKILL_EXTRACTION_AVAILABLE = False
 
 
 # =============================================================================
-# 1. TEXT CLEANING  (giữ nguyên từ pdf_utils.py)
+# 1. CONVERTER FACTORY
+# =============================================================================
+
+def build_converter(*, ocr: bool = False, table_structure: bool = True) -> DocumentConverter:
+    opts = PdfPipelineOptions(do_ocr=ocr, do_table_structure=table_structure)
+    return DocumentConverter(
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
+    )
+
+
+# =============================================================================
+# 2. TEXT CLEANING
 # =============================================================================
 
 def fix_spaced_letters(text: str) -> str:
-    """S T R E N G T H  →  STRENGTH"""
+    """S T R E N G T H -> STRENGTH (lỗi encoding PDF phổ biến)."""
     return re.sub(
         r'\b(?:[A-Za-z]\s){3,}[A-Za-z]\b',
         lambda m: m.group(0).replace(" ", ""),
@@ -46,6 +49,7 @@ def fix_spaced_letters(text: str) -> str:
 
 
 def clean_text(text: str) -> str:
+    """Unescape HTML, fix spaced letters, collapse whitespace."""
     text = html.unescape(text)
     text = fix_spaced_letters(text)
     text = re.sub(r'[ \t]+', ' ', text)
@@ -54,288 +58,267 @@ def clean_text(text: str) -> str:
 
 
 # =============================================================================
-# 2. PDF EXTRACTION  (layout-aware, từ pdf_utils.py)
+# 3. PDF -> DOCLING DOCUMENT
 # =============================================================================
 
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages = []
-
-    for page in doc:
-        blocks = page.get_text("blocks")
-        # sắp xếp top-down, left-right
-        blocks = sorted(blocks, key=lambda b: (round(b[1] / 5) * 5, b[0]))
-
-        page_lines = []
-        for block in blocks:
-            text = block[4].strip()
-            if text:
-                page_lines.append(text)
-
-        pages.append("\n".join(page_lines))
-
-    full_text = "\n\n".join(pages)
-
-    if len(full_text.strip()) < 100:
-        raise ValueError("PDF có thể là scan image – cần OCR fallback")
-
-    return clean_text(full_text)
+def _load_document(pdf_source: str | Path | bytes, converter: DocumentConverter):
+    """Convert PDF -> Docling Document. Nhận path hoặc bytes."""
+    if isinstance(pdf_source, bytes):
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(pdf_source)
+            tmp_path = tmp.name
+        try:
+            return converter.convert(tmp_path).document
+        finally:
+            os.unlink(tmp_path)
+    return converter.convert(str(pdf_source)).document
 
 
 # =============================================================================
-# 3. SECTION DETECTION  (từ pdf_utils.py)
+# 4. CANDIDATE NAME EXTRACTION
 # =============================================================================
 
-SECTION_HEADERS = {
-    "experience":     ["experience", "work experience", "employment history",
-                       "professional experience", "work history", "kinh nghiệm"],
-    "education":      ["education", "academic background", "academic history",
-                       "học vấn", "trình độ học vấn"],
-    "skills":         ["skills", "technical skills", "core competencies",
-                       "key skills", "kỹ năng", "kỹ năng kỹ thuật"],
-    "summary":        ["summary", "objective", "profile", "about me",
-                       "career objective", "tóm tắt", "mục tiêu"],
-    "certifications": ["certifications", "certificates", "chứng chỉ",
-                       "licenses & certifications"],
-    "activities":     ["activities", "extracurricular", "volunteer",
-                       "hoạt động", "hoạt động ngoại khóa"],
-    "projects":       ["projects", "personal projects", "dự án",
-                       "key projects", "project experience"],
-    "awards":         ["awards", "honors", "achievements",
-                       "giải thưởng", "thành tích"],
-}
+def _extract_candidate_name(doc) -> Optional[str]:
+    """
+    Trích xuất tên ứng viên từ phần đầu document.
+    Tìm text element ngắn (1-6 từ), bắt đầu chữ hoa,
+    không chứa keyword section hoặc thông tin liên lạc.
+    """
+    skip = {
+        "experience", "education", "skills", "contact", "summary",
+        "objective", "profile", "about", "resume", "cv", "certif",
+        "language", "project", "activities", "awards", "strength",
+        "information", "personal", "career", "work", "employment",
+    }
+    try:
+        for item in doc.iterate_items():
+            text = ""
+            if hasattr(item, 'text'):
+                text = item.text.strip()
+            elif hasattr(item, 'export_to_text'):
+                text = item.export_to_text().strip()
 
-SECTION_KEYWORDS = {
-    "summary":        ["objective", "summary", "seeking", "motivated", "goal"],
-    "skills":         ["python", "java", "react", "sql", "linux", "docker",
-                       "git", "javascript", "html", "css", "mongodb", "fastapi"],
-    "experience":     ["configured", "implemented", "managed", "responsible",
-                       "developed", "deployed", "worked", "project", "built"],
-    "education":      ["university", "college", "degree", "student", "gpa", "bachelor"],
-    "certifications": ["certificate", "certification", "toeic", "ielts"],
-    "activities":     ["activities", "volunteer", "club", "participate"],
-}
+            if not text:
+                continue
 
-SECTION_PRIORITY = ["experience", "education", "skills",
-                    "summary", "certifications", "activities"]
+            text = fix_spaced_letters(text)
+            lower = text.lower()
 
+            if any(kw in lower for kw in skip):
+                continue
+            if re.search(r'[@+\d/\\:]', text):
+                continue
+            words = text.split()
+            if not (1 <= len(words) <= 6):
+                continue
+            if not text[0].isupper():
+                continue
+            if sum(c.isalpha() for c in text) / len(text) < 0.7:
+                continue
 
-def is_section_header(text: str) -> str | None:
-    t = text.strip().lower()
-    if len(t) > 50:
-        return None
-    for section, keywords in SECTION_HEADERS.items():
-        if any(t == kw or t.startswith(kw) for kw in keywords):
-            return section
+            return text
+    except Exception:
+        pass
+
     return None
 
 
-def guess_section_by_pattern(text: str) -> str | None:
-    t = text.lower()
-    if re.search(r'gpa|university|college|student|\(20\d{2}', t):
-        return "education"
-    if re.search(r'configured|implemented|managed|deployed|set up|developed|built', t):
-        return "experience"
-    if ":" in text and len(text.split(",")) >= 3:
-        tech_hints = ["python", "java", "sql", "linux", "react", "docker",
-                      "git", "javascript", "html", "css", "mongodb", "fastapi",
-                      "node", "typescript", "aws", "azure", "gcp"]
-        if any(h in t for h in tech_hints):
-            return "skills"
-    return None
-
-
-def guess_section_by_keywords(text: str) -> str | None:
-    t = text.lower()
-    scores: Dict[str, int] = {}
-    for section, keywords in SECTION_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw in t)
-        if score > 0:
-            scores[section] = score
-    if not scores:
-        return None
-    max_score = max(scores.values())
-    top = [s for s, sc in scores.items() if sc == max_score]
-    if len(top) == 1:
-        return top[0]
-    for section in SECTION_PRIORITY:
-        if section in top:
-            return section
-    return top[0]
-
-
-def infer_section(text: str) -> str:
-    return (guess_section_by_pattern(text)
-            or guess_section_by_keywords(text)
-            or "other")
-
-
-def split_paragraphs(text: str) -> List[str]:
-    return [p.strip() for p in text.split("\n") if len(p.strip()) > 2]
-
-
-def group_by_section(paragraphs: List[str]) -> Dict[str, List[str]]:
-    grouped: Dict[str, List[str]] = {}
-    current_section = "other"
-    for p in paragraphs:
-        header = is_section_header(p)
-        if header:
-            current_section = header
-            continue
-        grouped.setdefault(current_section, []).append(p)
-    return grouped
-
-
 # =============================================================================
-# 4. SEMANTIC CHUNKER WRAPPER
+# 5. SECTION LABEL TỪ HEADING PATH
 # =============================================================================
 
-def build_semantic_chunker(
-    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-    breakpoint_threshold_type: Literal[
-        "percentile", "standard_deviation", "interquartile", "gradient"
-    ] = "percentile",
-    breakpoint_threshold_amount: float = 80.0,
-    buffer_size: int = 1,
-    min_chunk_size: int | None = 30,
-) -> SemanticChunker:
+def _heading_to_section(headings: List[str]) -> str:
     """
-    Tạo SemanticChunker dùng HuggingFace embeddings (không cần API key).
-
-    Tham số chính:
-        model_name               - model HuggingFace để embed câu
-        breakpoint_threshold_type- cách tính điểm ngắt:
-                                   'percentile'         → ngắt khi similarity < X-th percentile (mặc định)
-                                   'standard_deviation' → ngắt khi < mean - X*std
-                                   'interquartile'      → dùng IQR
-                                   'gradient'           → dựa trên gradient thay đổi
-        breakpoint_threshold_amount - ngưỡng (ý nghĩa tuỳ loại trên)
-        buffer_size              - số câu lân cận để tính similarity trung bình
-        min_chunk_size           - số ký tự tối thiểu mỗi chunk (lọc chunk rác)
+    Chuyển heading path từ Docling thành section label chuẩn.
+    Dùng semantic matching (embedding-based) — không dùng keyword dict.
     """
-    embeddings = HuggingFaceEmbeddings(
-        model_name=model_name,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
-    )
-    return SemanticChunker(
-        embeddings=embeddings,
-        buffer_size=buffer_size,
-        breakpoint_threshold_type=breakpoint_threshold_type,
-        breakpoint_threshold_amount=breakpoint_threshold_amount,
-        min_chunk_size=min_chunk_size,
-    )
+    return normalize_headings_semantic(headings)
 
 
 # =============================================================================
-# 5. MAIN PIPELINE
+# 6. MAIN PIPELINE
 # =============================================================================
 
 def cv_pdf_to_semantic_chunks(
-    pdf_bytes: bytes,
-    chunker: SemanticChunker | None = None,
+    pdf_source: str | Path | bytes,
     *,
-    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-    breakpoint_threshold_type: Literal[
-        "percentile", "standard_deviation", "interquartile", "gradient"
-    ] = "percentile",
-    breakpoint_threshold_amount: float = 80.0,
-    buffer_size: int = 1,
-    min_chunk_size: int = 30,
+    merge_peers: bool = True,
+    converter: Optional[DocumentConverter] = None,
+    ocr: bool = False,
+    semantic_merge_threshold: float = 0.7,
 ) -> List[Dict]:
     """
-    Pipeline hoàn chỉnh: PDF bytes → List[{section, text, chunk_index}]
+    Pipeline chính: PDF -> List[Dict] semantic chunks.
 
-    Truyền `chunker` nếu đã khởi tạo sẵn (tái sử dụng model, tránh load lại).
-    Nếu không truyền, hàm tự tạo chunker với các tham số còn lại.
+    Luồng:
+      1. Docling convert PDF -> Document
+      2. HierarchicalChunker tạo chunks theo cấu trúc heading
+      3. _heading_to_section gán section label qua semantic matching
+      4. (Tuỳ chọn) extract implicit skills từ experience chunks
+      5. merge_semantically_similar_chunks gộp chunk nhỏ theo ngữ nghĩa
 
-    Trả về:
-        [
-          {
-            "section":     "experience",   # section từ CV
-            "text":        "...",          # nội dung chunk
-            "chunk_index": 0,             # thứ tự chunk trong section
-          },
-          ...
-        ]
+    Returns:
+        [{"section", "text", "chunk_index", "headings", "candidate_name"?}, ...]
     """
-    # ── bước 1-2: trích xuất & phân section ──────────────────────────────────
-    raw_text   = extract_text_from_pdf(pdf_bytes)
-    paragraphs = split_paragraphs(raw_text)
-    sections   = group_by_section(paragraphs)
+    if converter is None:
+        converter = build_converter(ocr=ocr)
 
-    # ── bước 3: khởi tạo chunker nếu chưa có ────────────────────────────────
-    if chunker is None:
-        chunker = build_semantic_chunker(
-            model_name=model_name,
-            breakpoint_threshold_type=breakpoint_threshold_type,
-            breakpoint_threshold_amount=breakpoint_threshold_amount,
-            buffer_size=buffer_size,
-            min_chunk_size=min_chunk_size,
-        )
+    # Bước 1: Convert PDF
+    doc = _load_document(pdf_source, converter)
 
-    # ── bước 4: semantic chunking theo từng section ──────────────────────────
+    # Bước 2: Extract tên ứng viên
+    candidate_name = _extract_candidate_name(doc)
+
+    # Bước 3: Chunk theo cấu trúc document
+    chunker = HierarchicalChunker(merge_peers=merge_peers)
+    raw_chunks = list(chunker.chunk(doc))
+
+    # Bước 4: Build kết quả
     results: List[Dict] = []
+    is_first = True
 
-    for section, paras in sections.items():
-        # Ghép các đoạn trong section thành một khối văn bản
-        section_text = "\n".join(paras).strip()
-        if not section_text:
+    for raw in raw_chunks:
+        # Lấy text
+        chunk_text = ""
+        if hasattr(raw, 'text'):
+            chunk_text = raw.text.strip()
+        if not chunk_text and hasattr(raw, 'export_to_text'):
+            chunk_text = raw.export_to_text().strip()
+        if not chunk_text:
             continue
 
-        # SemanticChunker.create_documents nhận list[str]
-        docs = chunker.create_documents([section_text])
+        chunk_text = clean_text(chunk_text)
+        if len(chunk_text) < 20:
+            continue
 
-        for idx, doc in enumerate(docs):
-            chunk_text = doc.page_content.strip()
-            if len(chunk_text) < min_chunk_size:
-                continue  # bỏ chunk quá ngắn / rác
-            results.append(
-                {
-                    "section":     section,
-                    "text":        chunk_text,
-                    "chunk_index": idx,
-                }
-            )
+        # Lấy và normalize heading path
+        headings: List[str] = []
+        if hasattr(raw, 'meta') and raw.meta:
+            raw_headings = getattr(raw.meta, 'headings', None) or []
+            headings = [fix_spaced_letters(h).strip() for h in raw_headings]
+
+        section = _heading_to_section(headings)
+
+        entry: Dict = {
+            "section":     section,
+            "text":        chunk_text,
+            "chunk_index": len(results),
+            "headings":    headings,
+        }
+        if is_first and candidate_name:
+            entry["candidate_name"] = candidate_name
+            is_first = False
+
+        results.append(entry)
+
+        # Extract implicit skills từ experience chunk (gọi Bedrock)
+        if section == "experience" and SKILL_EXTRACTION_AVAILABLE:
+            try:
+                skills = extract_skills_from_experience(chunk_text)
+                if skills:
+                    source_index = len(results) - 1  # index của experience chunk vừa append
+                    results.append({
+                        "section":      "skills",        # nhất quán với các section label khác
+                        "text":         "\n".join(skills),
+                        "chunk_index":  len(results),
+                        "headings":     headings,
+                        "source_chunk": source_index,    # tính đúng sau khi đã append
+                    })
+            except Exception as e:
+                print(f"[WARNING] Failed to extract implicit skills: {e}")
+
+    # Bước 5: Merge chunk nhỏ theo semantic similarity
+    results = merge_semantically_similar_chunks(
+        results,
+        min_chars=80,
+        similarity_threshold=semantic_merge_threshold,
+    )
+
+    # Re-index
+    for i, r in enumerate(results):
+        r["chunk_index"] = i
 
     return results
 
 
 # =============================================================================
-# 6. CLI / TEST
+# 7. PDF -> MARKDOWN
+# =============================================================================
+
+def pdf_to_markdown(
+    pdf_source: str | Path | bytes,
+    *,
+    include_toc: bool = False,
+    ocr: bool = False,
+    converter: Optional[DocumentConverter] = None,
+) -> str:
+    if converter is None:
+        converter = build_converter(ocr=ocr)
+    doc = _load_document(pdf_source, converter)
+    md = clean_text(doc.export_to_markdown())
+
+    if include_toc:
+        headings = re.findall(r'^(#{1,3}) (.+)', md, re.MULTILINE)
+        if headings:
+            toc = ["## Table of Contents\n"]
+            for hashes, title in headings:
+                indent = "  " * (len(hashes) - 1)
+                anchor = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
+                toc.append(f"{indent}- [{title}](#{anchor})")
+            md = "\n".join(toc) + "\n\n---\n\n" + md
+
+    return md
+
+
+# =============================================================================
+# 8. CLI
 # =============================================================================
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python cv_semantic_chunker.py <cv.pdf> [threshold_percentile]")
-        sys.exit(1)
+    import argparse
 
-    pdf_path   = sys.argv[1]
-    threshold  = float(sys.argv[2]) if len(sys.argv) > 2 else 80.0
+    parser = argparse.ArgumentParser(description="pdf_utils - Docling CV processor")
+    parser.add_argument("pdf",              help="Duong dan file PDF")
+    parser.add_argument("-o", "--output",   help="Luu Markdown ra file")
+    parser.add_argument("--chunk",          action="store_true", help="In semantic chunks")
+    parser.add_argument("--ocr",            action="store_true", help="Bat OCR")
+    parser.add_argument("--toc",            action="store_true", help="Them TOC vao markdown")
+    parser.add_argument("--sim-threshold",  type=float, default=0.7,
+                        help="Similarity threshold cho semantic merging (0-1)")
+    parser.add_argument("--test-heading",   type=str,
+                        help="Test semantic section detection cho mot heading cu the")
+    parser.add_argument("--save-cache",     action="store_true",
+                        help="Luu embedding cache sau khi process")
+    args = parser.parse_args()
 
-    print(f"\n[1/3] Đọc file: {pdf_path}")
-    with open(pdf_path, "rb") as f:
-        pdf_bytes = f.read()
+    conv = build_converter(ocr=args.ocr)
 
-    print("[2/3] Khởi tạo SemanticChunker (HuggingFace MiniLM)…")
-    chunker = build_semantic_chunker(
-        breakpoint_threshold_type="percentile",
-        breakpoint_threshold_amount=threshold,
-    )
+    if args.test_heading:
+        debug_heading_scores(args.test_heading)
+        exit(0)
 
-    print("[3/3] Chunking…")
-    chunks = cv_pdf_to_semantic_chunks(pdf_bytes, chunker=chunker)
+    if args.chunk:
+        chunks = cv_pdf_to_semantic_chunks(
+            args.pdf,
+            converter=conv,
+            semantic_merge_threshold=args.sim_threshold,
+        )
+        print(f"\nTong chunks: {len(chunks)}\n")
+        for c in chunks:
+            name_info = f"  [Candidate: {c['candidate_name']}]" if "candidate_name" in c else ""
+            hdg_info  = f"  [{' > '.join(c['headings'])}]" if c.get("headings") else ""
+            print(f"{'─'*60}")
+            print(f"Section: {c['section'].upper()}  |  #{c['chunk_index']}{name_info}{hdg_info}")
+            print(c["text"][:400])
+            if len(c["text"]) > 400:
+                print("...")
 
-    # ── thống kê ─────────────────────────────────────────────────────────────
-    print(f"\n✅ Tổng số chunks: {len(chunks)}")
-
-    section_counts = Counter(ch["section"] for ch in chunks)
-    print("\nPhân bố theo section:")
-    for section, count in sorted(section_counts.items()):
-        print(f"  {section:<20} {count} chunks")
-
-    print("\n--- Chi tiết 10 chunks đầu ---")
-    for i, ch in enumerate(chunks[:10]):
-        print(f"\n{'─'*60}")
-        print(f"Chunk {i:02d} | section={ch['section']} | index_in_section={ch['chunk_index']}")
-        print(ch["text"][:400])
+        if args.save_cache:
+            save_embedding_cache()
+    else:
+        md = pdf_to_markdown(args.pdf, include_toc=args.toc, converter=conv)
+        if args.output:
+            Path(args.output).write_text(md, encoding="utf-8")
+            print(f"Da luu: {args.output}")
+        else:
+            print(md)
