@@ -3,26 +3,24 @@ import re
 import html
 import tempfile
 import os
-import logging
 from pathlib import Path
 from typing import Any, List, Dict, Optional
+from datetime import datetime
 
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.datamodel.base_models import InputFormat
 from docling.chunking import HybridChunker
 
-log = logging.getLogger(__name__)
 
-
-# ── Converter ─────────────────────────────────────────────────────────────────
+# â”€â”€ Converter â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def build_converter(*, ocr: bool = False, table_structure: bool = True) -> DocumentConverter:
     opts = PdfPipelineOptions(do_ocr=ocr, do_table_structure=table_structure)
     return DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)})
 
 
-# ── Text helpers ──────────────────────────────────────────────────────────────
+# â”€â”€ Text helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def fix_spaced_letters(text: str) -> str:
     return re.sub(r'\b(?:[A-Z]\s){3,}[A-Z]\b', lambda m: m.group(0).replace(" ", ""), text)
@@ -35,7 +33,7 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-# ── Document loading ──────────────────────────────────────────────────────────
+# â”€â”€ Document loading â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _load_document(pdf_source: str | Path | bytes, converter: DocumentConverter):
     if isinstance(pdf_source, bytes):
@@ -49,7 +47,7 @@ def _load_document(pdf_source: str | Path | bytes, converter: DocumentConverter)
     return converter.convert(str(pdf_source)).document
 
 
-# ── Chunk helpers ─────────────────────────────────────────────────────────────
+# â”€â”€ Chunk helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _merge_small_chunks(chunks: List[Dict], min_chars: int = 80, max_chars: int = 1200) -> List[Dict]:
     if not chunks:
@@ -66,9 +64,7 @@ def _merge_small_chunks(chunks: List[Dict], min_chars: int = 80, max_chars: int 
     return merged
 
 
-# ── PII / embed filtering ─────────────────────────────────────────────────────
-# FIX 1: mỗi section là phần tử set riêng biệt (code cũ là 1 string khổng lồ)
-# FIX 2: không skip nếu PII block chứa education/skills
+# â”€â”€ PII / embed filtering â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 SKIP_EMBED_SECTIONS: set = {
     "contact information", "contact   information",
@@ -81,20 +77,15 @@ _RE_PII = re.compile(
     r"\b(contact|personal\s+info|references?|referee|liên\s+hệ|địa\s+chỉ|thông\s+tin\s+cá\s+nhân)\b",
     re.IGNORECASE,
 )
-_RE_VALUABLE = re.compile(
-    r"\b(university|college|school|degree|gpa|bachelor|master|phd|intern|project|"
-    r"skill|experience|worked|years?|trường|đại\s+học|kỹ\s+năng|kinh\s+nghiệm|dự\s+án)\b",
-    re.IGNORECASE,
-)
 
-SKIP_EMBED_SECTIONS.update({"thông tin cá nhân", "liên hệ", "địa chỉ"})
-_RE_PII = re.compile(
-    r"\b(contact|personal\s+info|references?|referee|liên\s+hệ|địa\s+chỉ|thông\s+tin\s+cá\s+nhân)\b",
+_RE_VALUABLE_EDU = re.compile(
+    r"\b(degree|gpa|bachelor|master|phd|d\.sc|b\.sc|m\.sc|specialization|major|faculty|"
+    r"tá»‘t\s+nghiá»‡p|chuyÃªn\s+ngÃ nh|khoa|báº±ng\s+(?:cá»­\s+nhÃ¢n|tháº¡c\s+sÄ©|tiáº¿n\s+sÄ©))\b",
     re.IGNORECASE,
 )
-_RE_VALUABLE = re.compile(
-    r"\b(university|college|school|degree|gpa|bachelor|master|phd|intern|project|"
-    r"skill|experience|worked|years?|trường|đại\s+học|kỹ\s+năng|kinh\s+nghiệm|dự\s+án)\b",
+_RE_VALUABLE_OTHER = re.compile(
+    r"\b(skill|experience|worked|intern|project|years?\s+of\s+experience|"
+    r"ká»¹\s+nÄƒng|kinh\s+nghiá»‡m|dá»±\s+Ã¡n)\b",
     re.IGNORECASE,
 )
 
@@ -105,23 +96,17 @@ def _is_pii_section(chunk: Dict) -> bool:
 def _should_embed(chunk: Dict) -> bool:
     if not _is_pii_section(chunk):
         return True
-    return bool(_RE_VALUABLE.search(chunk.get("text", "")))
+    text = chunk.get("text", "")
+    # Chá»‰ embed PII block náº¿u chá»©a signal há»c vá»‹ rÃµ rÃ ng HOáº¶C signal experience/skill
+    return bool(_RE_VALUABLE_EDU.search(text) or _RE_VALUABLE_OTHER.search(text))
 
 
-# ── Extraction schema & helpers ───────────────────────────────────────────────
-
+# â”€â”€ LLM extraction helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 EMPTY_CV_EXTRACTION: Dict[str, Any] = {
     "technical_skills": [], "soft_skills": [], "companies": [],
-    "total_experience_years": None, "projects": [], "education": [],
-    "chunk_skills": [],
+    "total_experience_years": None, "total_experience_months": 0,
+    "experience_duration": "0 years", "projects": [], "education": [],
 }
-
-def _empty_cv_extraction() -> Dict[str, Any]:
-    return {
-        "technical_skills": [], "soft_skills": [], "companies": [],
-        "total_experience_years": None, "projects": [], "education": [],
-        "chunk_skills": [],
-    }
 
 def _as_list(v: Any) -> List[Any]:
     return v if isinstance(v, list) else []
@@ -157,7 +142,7 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 def _normalize_extraction(data: Dict[str, Any]) -> Dict[str, Any]:
-    n = _empty_cv_extraction()
+    n = EMPTY_CV_EXTRACTION.copy()
     n["technical_skills"] = _clean_string_list(data.get("technical_skills"))
     n["soft_skills"]       = _clean_string_list(data.get("soft_skills"))
     n["companies"]  = _clean_dict_list(data.get("companies"),  ["name","role","duration","years","skills"])
@@ -171,6 +156,204 @@ def _normalize_extraction(data: Dict[str, Any]) -> Dict[str, Any]:
         n["total_experience_years"] = float(m.group(0)) if m else None
     return n
 
+
+def _experience_display(total_months: int) -> str:
+    if total_months <= 0:
+        return "0 years"
+    if total_months < 12:
+        return f"{total_months} month" + ("" if total_months == 1 else "s")
+    years = round(total_months / 12)
+    return f"{years} year" + ("" if years == 1 else "s")
+
+
+def _experience_years_for_matching(total_months: int) -> float:
+    if total_months <= 0:
+        return 0
+    if total_months < 12:
+        return round(total_months / 12, 2)
+    return float(round(total_months / 12))
+
+
+def _extract_total_experience_months(text: str) -> int:
+    intervals = _extract_date_intervals(text)
+    if intervals:
+        months = _merge_and_sum_intervals(intervals)
+        if months > 0:
+            return min(months, 60 * 12)
+
+    explicit_months = _extract_explicit_duration_months(text)
+    if explicit_months > 0:
+        return min(explicit_months, 60 * 12)
+
+    return 0
+
+
+def _extract_explicit_duration_months(text: str) -> int:
+    text = _normalize_duration_words(text)
+    total = 0
+    seen_spans = []
+
+    duration_pattern = re.compile(
+        r"(?<!\d)(\d+(?:\.\d+)?)\s*\+?\s*"
+        r"(years?|yrs?|yoe|nam|năm|months?|mos?|thang|tháng)\b",
+        re.IGNORECASE,
+    )
+    for match in duration_pattern.finditer(text):
+        number = float(match.group(1))
+        unit = match.group(2).lower()
+        months = round(number * 12) if unit.startswith(("year", "yr", "yoe", "nam", "năm")) else round(number)
+        total += months
+        seen_spans.append(match.span())
+
+    if total:
+        return total
+
+    summary_patterns = [
+        r"(?:over|more\s+than|almost|about|around|approximately)?\s*(\d+(?:\.\d+)?)\s*\+?\s*years?\s+of\s+experience",
+        r"experience\s*(?:of|:)?\s*(\d+(?:\.\d+)?)\s*\+?\s*years?",
+    ]
+    for pattern in summary_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return round(float(match.group(1)) * 12)
+
+    return 0
+
+
+def _normalize_duration_words(text: str) -> str:
+    numbers = {
+        "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+        "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+        "eleven": "11", "twelve": "12",
+    }
+    for word, number in numbers.items():
+        text = re.sub(rf"\b{word}\b", number, text, flags=re.IGNORECASE)
+    return text
+
+
+def _finalize_experience_extraction(extraction: Dict[str, Any], cv_text: str) -> Dict[str, Any]:
+    finalized = extraction.copy()
+    months = _extract_total_experience_months(cv_text)
+
+    if months <= 0 and isinstance(finalized.get("total_experience_years"), (int, float)):
+        months = round(float(finalized["total_experience_years"]) * 12)
+
+    months = max(months, 0)
+    finalized["total_experience_months"] = months
+    finalized["total_experience_years"] = _experience_years_for_matching(months)
+    finalized["experience_duration"] = _experience_display(months)
+    return finalized
+
+
+def _chunk_experience_metadata(chunk: Dict[str, Any]) -> Dict[str, Any]:
+    if _normalized_cv_section(chunk) != "experience":
+        return {}
+
+    months = _extract_total_experience_months(chunk.get("text", ""))
+    years = _experience_years_for_matching(months)
+    return {
+        "chunk_experience_months": months,
+        "chunk_experience_years": years,
+        "chunk_experience_duration": _experience_display(months),
+    }
+
+
+def _extract_date_intervals(text: str) -> List[tuple[int, int]]:
+    current = datetime.now()
+    current_index = _month_index(current.year, current.month)
+    intervals: List[tuple[int, int]] = []
+
+    month_names = (
+        r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+        r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
+        r"nov(?:ember)?|dec(?:ember)?"
+    )
+    separator = r"(?:-|–|—|to|until|through)"
+    end_token = rf"(?:(?:{month_names})\s+\d{{4}}|\d{{1,2}}/\d{{4}}|\d{{4}}|present|current|now|ongoing)"
+    patterns = [
+        rf"(?P<start_month>{month_names})\s+(?P<start_year>\d{{4}})\s*{separator}\s*(?P<end>{end_token})",
+        rf"(?P<start_month_num>\d{{1,2}})/(?P<start_year_num>\d{{4}})\s*{separator}\s*(?P<end>{end_token})",
+        rf"(?P<start_year_only>\d{{4}})\s*{separator}\s*(?P<end>{end_token})",
+    ]
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            start_index = _parse_start_date(match)
+            end_index = _parse_end_date(match.group("end"), current_index)
+            if start_index is None or end_index is None or end_index < start_index:
+                continue
+            intervals.append((start_index, end_index))
+
+    return intervals
+
+
+def _parse_start_date(match: re.Match) -> int | None:
+    g = match.groupdict()
+    if g.get("start_month") and g.get("start_year"):
+        return _month_index(int(match.group("start_year")), _month_name_to_number(match.group("start_month")))
+    if g.get("start_month_num") and g.get("start_year_num"):
+        month, year = int(match.group("start_month_num")), int(match.group("start_year_num"))
+        return _month_index(year, month) if 1 <= month <= 12 else None
+    if g.get("start_year_only"):
+        return _month_index(int(match.group("start_year_only")), 1)
+    return None
+
+
+def _parse_end_date(value: str, current_index: int) -> int | None:
+    value = value.strip().lower()
+    if value in {"present", "current", "now", "ongoing"}:
+        return current_index
+
+    m = re.fullmatch(
+        r"(?P<month>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+        r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+        r"\s+(?P<year>\d{4})",
+        value,
+        re.IGNORECASE,
+    )
+    if m:
+        return _month_index(int(m.group("year")), _month_name_to_number(m.group("month")))
+
+    m = re.fullmatch(r"(?P<month>\d{1,2})/(?P<year>\d{4})", value)
+    if m:
+        month, year = int(m.group("month")), int(m.group("year"))
+        return _month_index(year, month) if 1 <= month <= 12 else None
+
+    if re.fullmatch(r"\d{4}", value):
+        return _month_index(int(value), 12)
+
+    return None
+
+
+def _month_name_to_number(value: str) -> int:
+    months = {
+        "jan": 1, "january": 1, "feb": 2, "february": 2,
+        "mar": 3, "march": 3, "apr": 4, "april": 4, "may": 5,
+        "jun": 6, "june": 6, "jul": 7, "july": 7,
+        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+        "oct": 10, "october": 10, "nov": 11, "november": 11,
+        "dec": 12, "december": 12,
+    }
+    return months[value.strip().lower()]
+
+
+def _month_index(year: int, month: int) -> int:
+    return year * 12 + month
+
+
+def _merge_and_sum_intervals(intervals: List[tuple[int, int]]) -> int:
+    if not intervals:
+        return 0
+    intervals = sorted(intervals)
+    merged = [list(intervals[0])]
+    for start, end in intervals[1:]:
+        last = merged[-1]
+        if start <= last[1] + 1:
+            last[1] = max(last[1], end)
+        else:
+            merged.append([start, end])
+    return sum(end - start + 1 for start, end in merged)
+
 def _dedupe_strings(items: List[str], limit: int = 40) -> List[str]:
     seen, result = set(), []
     for item in items:
@@ -180,13 +363,12 @@ def _dedupe_strings(items: List[str], limit: int = 40) -> List[str]:
     return result[:limit]
 
 
-# ── FIX 3: Company fuzzy matching ─────────────────────────────────────────────
-# Cũ: exact substring → miss alias, legal suffix, dấu câu
+# â”€â”€ Company fuzzy matching â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _normalize_company_name(name: str) -> str:
     name = re.sub(
         r'\b(inc|llc|ltd|limited|corp|corporation|co|company|group|holdings?|'
-        r'joint\s+stock|jsc|tnhh|cp|cty|công\s+ty)\b\.?',
+        r'joint\s+stock|jsc|tnhh|cp|cty|cÃ´ng\s+ty)\b\.?',
         '', name.lower(), flags=re.IGNORECASE,
     )
     return re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', ' ', name)).strip()
@@ -200,9 +382,7 @@ def _company_name_matches(company_name: str, haystack: str) -> bool:
     return sum(1 for t in tokens if t in nh) / len(tokens) >= 0.75
 
 
-# ── Skill extraction helpers ──────────────────────────────────────────────────
-# Skills are extracted by the LLM. Local code only maps extracted skills back to
-# the chunks where they appear, so embedding_text stays explicit.
+# â”€â”€ Skill extraction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _RE_SOFT_SKILL_LABEL = re.compile(
     r"\b(strengths?|soft\s+skills?|personal\s+skills?|attributes?|qualities)\b",
@@ -220,232 +400,32 @@ def _label_for_chunk(chunk: Dict) -> str:
 def _is_soft_skill_section_label(label: str) -> bool:
     return bool(_RE_SOFT_SKILL_LABEL.search(label))
 
+def _extract_soft_skills_from_soft_sections(chunks: List[Dict]) -> List[str]:
+    skills = []
+    for chunk in chunks:
+        label = _label_for_chunk(chunk).lower()
+        if not _is_soft_skill_section_label(label):
+            continue
+        for line in chunk.get("text", "").splitlines():
+            line = clean_text(re.sub(r"^[\-\u2022*]\s*", "", line))
+            if line and 2 <= len(line) <= 120:
+                skills.append(line)
+    return _dedupe_strings(skills, limit=30)
+
 def _merge_extracted_skills(extraction: Dict[str, Any], chunks: List[Dict]) -> Dict[str, Any]:
     merged = extraction.copy()
-    merged["technical_skills"] = _dedupe_strings(extraction.get("technical_skills", []), limit=80)
-    merged["soft_skills"] = _dedupe_strings(extraction.get("soft_skills", []), limit=30)
-    return merged
-
-
-# Heuristic fallback keeps extraction resilient when CV sections are missing,
-# mislabeled, or when the LLM misses facts hidden in non-standard sections.
-_TECH_SKILL_PATTERNS = [
-    ("Python", r"python"),
-    ("Java", r"java"),
-    ("JavaScript", r"java\s*script|javascript"),
-    ("TypeScript", r"type\s*script|typescript"),
-    ("C++", r"c\+\+"),
-    ("C#", r"c#"),
-    ("PHP", r"php"),
-    ("Go", r"golang|\bgo\b"),
-    ("SQL", r"sql"),
-    ("MySQL", r"mysql"),
-    ("PostgreSQL", r"postgre\s*sql|postgres"),
-    ("MongoDB", r"mongo\s*db|mongodb"),
-    ("Redis", r"redis"),
-    ("HTML", r"html"),
-    ("CSS", r"css"),
-    ("React", r"react(?:\.js)?"),
-    ("Angular", r"angular"),
-    ("Vue", r"vue(?:\.js)?"),
-    ("Node.js", r"node(?:\.js)?|nodejs"),
-    ("Express", r"express(?:\.js)?"),
-    ("Django", r"django"),
-    ("Flask", r"flask"),
-    ("FastAPI", r"fast\s*api|fastapi"),
-    ("REST API", r"rest(?:ful)?\s+api"),
-    ("Spring Boot", r"spring\s+boot"),
-    ("Docker", r"docker"),
-    ("Kubernetes", r"kubernetes|k8s"),
-    ("AWS", r"aws|amazon\s+web\s+services"),
-    ("Azure", r"azure"),
-    ("GCP", r"gcp|google\s+cloud"),
-    ("Git", r"git"),
-    ("Linux", r"linux"),
-    ("Excel", r"excel"),
-    ("Power BI", r"power\s*bi"),
-    ("Tableau", r"tableau"),
-    ("Machine Learning", r"machine\s+learning"),
-    ("Deep Learning", r"deep\s+learning"),
-    ("NLP", r"\bnlp\b|natural\s+language\s+processing"),
-    ("Pandas", r"pandas"),
-    ("NumPy", r"numpy"),
-    ("Scikit-learn", r"scikit[\s-]?learn|sklearn"),
-    ("TensorFlow", r"tensorflow"),
-    ("PyTorch", r"pytorch"),
-    ("Selenium", r"selenium"),
-    ("Appium", r"appium"),
-    ("Pytest", r"pytest"),
-    ("JUnit", r"junit"),
-    ("Postman", r"postman"),
-    ("Bruno", r"bruno"),
-    ("JMeter", r"jmeter"),
-    ("Android Studio", r"android\s+studio"),
-    ("ADB", r"\badb\b"),
-    ("API testing", r"api\s+testing"),
-    ("Manual Testing", r"manual\s+testing"),
-    ("Automation Testing", r"automation\s+testing|automated\s+testing"),
-    ("Web Automation Testing", r"web\s+automation\s+testing"),
-    ("Mobile Testing", r"mobile\s+testing"),
-    ("Regression Testing", r"regression\s+testing"),
-    ("Smoke Testing", r"smoke\s+testing"),
-    ("Functional Testing", r"functional\s+testing"),
-    ("Test Case Design", r"test\s+case\s+design|test\s+cases?"),
-    ("Bug Reporting", r"bug\s+reporting|defect\s+reporting"),
-    ("Agile", r"agile|scrum"),
-    ("Figma", r"figma"),
-]
-
-_SOFT_SKILL_PATTERNS = [
-    ("communication", r"communication|communicate|giao\s+tiếp"),
-    ("teamwork", r"teamwork|team\s+work|collaborat|làm\s+việc\s+nhóm"),
-    ("leadership", r"leadership|leader|lãnh\s+đạo"),
-    ("problem solving", r"problem[\s-]?solving|giải\s+quyết\s+vấn\s+đề"),
-    ("critical thinking", r"critical\s+thinking|tư\s+duy\s+phản\s+biện"),
-    ("responsibility", r"responsib|trách\s+nhiệm"),
-    ("accountability", r"accountab"),
-    ("adaptability", r"adaptab|thích\s+nghi"),
-    ("open-minded", r"open[\s-]?minded|cởi\s+mở"),
-    ("eager to learn", r"eager\s+to\s+learn|willing\s+to\s+learn|ham\s+học|học\s+hỏi"),
-    ("self-driven", r"self[\s-]?driven|self[\s-]?motivated|chủ\s+động"),
-    ("time management", r"time\s+management|quản\s+lý\s+thời\s+gian"),
-    ("attention to detail", r"attention\s+to\s+detail|detail[\s-]?oriented|tỉ\s+mỉ|cẩn\s+thận"),
-    ("creativity", r"creativ|sáng\s+tạo"),
-]
-
-_RE_GPA = re.compile(
-    r"\b(?:gpa|cgpa|grade\s+point\s+average|điểm\s+trung\s+bình)\s*[:\-]?\s*"
-    r"([0-9](?:\.\d+)?(?:\s*/\s*[0-9](?:\.\d+)?)?)",
-    re.IGNORECASE,
-)
-_RE_SCHOOL_LINE = re.compile(
-    r"\b(university|college|institute|academy|school|polytechnic|"
-    r"đại\s+học|trường|học\s+viện|cao\s+đẳng)\b",
-    re.IGNORECASE,
-)
-_RE_NOT_SCHOOL_LINE = re.compile(
-    r"\b(address|residing|dormitory|village|phone|email|gmail|facebook|linkedin|"
-    r"địa\s+chỉ|liên\s+hệ|ký\s+túc\s+xá)\b",
-    re.IGNORECASE,
-)
-_RE_DEGREE = re.compile(
-    r"\b(bachelor|master|phd|doctor|engineer|student|degree|diploma|"
-    r"cử\s+nhân|kỹ\s+sư|thạc\s+sĩ|tiến\s+sĩ|sinh\s+viên|bằng)\b",
-    re.IGNORECASE,
-)
-_RE_MAJOR = re.compile(
-    r"\b(?:major|specialization|field|faculty|department|ngành|chuyên\s+ngành|khoa)\s*[:\-]\s*(.+)",
-    re.IGNORECASE,
-)
-_RE_DURATION = re.compile(r"\b(?:19|20)\d{2}\s*(?:-|–|to|đến)\s*(?:present|now|current|(?:19|20)\d{2})\b", re.IGNORECASE)
-
-def _school_name_from_line(line: str) -> str:
-    label_match = re.search(
-        r"\b(?:university|college|institute|academy|school|trường|đại\s+học|học\s+viện|cao\s+đẳng)\s*:\s*(.+)",
-        line,
-        re.IGNORECASE,
-    )
-    if label_match:
-        return clean_text(label_match.group(1).strip(" -:;"))
-    embedded_match = re.search(
-        r"\b(university|college|institute|academy|school|đại\s+học|học\s+viện|cao\s+đẳng)\b.*",
-        line,
-        re.IGNORECASE,
-    )
-    return clean_text(embedded_match.group(0).strip(" -:;") if embedded_match else line)
-
-def _find_catalog_matches(text: str, catalog: List[tuple[str, str]], limit: int) -> List[str]:
-    found = []
-    for label, pattern in catalog:
-        if re.search(r"(?<![a-z0-9])(?:" + pattern + r")(?![a-z0-9])", text, re.IGNORECASE):
-            found.append(label)
-    return _dedupe_strings(found, limit=limit)
-
-def _heuristic_extract_education(chunks: List[Dict]) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    for chunk in chunks:
-        lines = [clean_text(line.strip("-*• \t")) for line in chunk.get("text", "").splitlines()]
-        lines = [line for line in lines if line]
-        for idx, line in enumerate(lines):
-            if not _RE_SCHOOL_LINE.search(line) or _RE_NOT_SCHOOL_LINE.search(line):
-                continue
-            window = "\n".join(lines[max(0, idx - 2): idx + 3])
-            row: Dict[str, Any] = {"school": _school_name_from_line(line)}
-
-            degree_match = _RE_DEGREE.search(window)
-            if degree_match:
-                row["degree"] = clean_text(degree_match.group(0))
-
-            major_match = _RE_MAJOR.search(window)
-            if major_match:
-                row["major"] = clean_text(major_match.group(1))
-
-            gpa_match = _RE_GPA.search(window)
-            if gpa_match:
-                row["gpa"] = clean_text(gpa_match.group(1))
-
-            duration_match = _RE_DURATION.search(window)
-            if duration_match:
-                row["duration"] = clean_text(duration_match.group(0))
-
-            rows.append(row)
-
-        gpa_match = _RE_GPA.search(chunk.get("text", ""))
-        if gpa_match and not any(r.get("gpa") == gpa_match.group(1) for r in rows):
-            rows.append({"gpa": clean_text(gpa_match.group(1))})
-
-    return _dedupe_dicts(rows, ["school", "degree", "major", "gpa", "duration"], limit=20)
-
-def _dedupe_dicts(items: List[Dict[str, Any]], keys: List[str], limit: int = 20) -> List[Dict[str, Any]]:
-    seen, result = set(), []
-    for item in items:
-        cleaned = {k: item[k] for k in keys if item.get(k) not in (None, "", [])}
-        if not cleaned:
-            continue
-        signature = tuple(str(cleaned.get(k, "")).lower() for k in keys)
-        if signature not in seen:
-            result.append(cleaned)
-            seen.add(signature)
-    return result[:limit]
-
-def _merge_cv_extractions(primary: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
-    merged = _empty_cv_extraction()
-    merged.update(primary)
     merged["technical_skills"] = _dedupe_strings(
-        primary.get("technical_skills", []) + fallback.get("technical_skills", []), limit=80
+        extraction.get("technical_skills", []),
+        limit=80,
     )
     merged["soft_skills"] = _dedupe_strings(
-        primary.get("soft_skills", []) + fallback.get("soft_skills", []), limit=30
-    )
-    merged["companies"] = _dedupe_dicts(
-        primary.get("companies", []) + fallback.get("companies", []),
-        ["name", "role", "duration", "years", "skills"],
-    )
-    merged["projects"] = _dedupe_dicts(
-        primary.get("projects", []) + fallback.get("projects", []),
-        ["name", "role", "duration", "technologies", "summary"],
-    )
-    merged["education"] = _dedupe_dicts(
-        primary.get("education", []) + fallback.get("education", []),
-        ["school", "degree", "major", "gpa", "duration"],
-    )
-    merged["total_experience_years"] = (
-        primary.get("total_experience_years")
-        if primary.get("total_experience_years") is not None
-        else fallback.get("total_experience_years")
+        extraction.get("soft_skills", []),
+        limit=30,
     )
     return merged
 
-def _heuristic_extract_cv_facts(chunks: List[Dict]) -> Dict[str, Any]:
-    text = "\n\n".join(chunk.get("text", "") for chunk in chunks)
-    extraction = _empty_cv_extraction()
-    extraction["technical_skills"] = _find_catalog_matches(text, _TECH_SKILL_PATTERNS, limit=80)
-    extraction["soft_skills"] = _find_catalog_matches(text, _SOFT_SKILL_PATTERNS, limit=30)
-    extraction["education"] = _heuristic_extract_education(chunks)
-    return extraction
 
-
-# ── Validation ────────────────────────────────────────────────────────────────
+# â”€â”€ Validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _contains_skill(text_lower: str, skill: str) -> bool:
     return bool(re.search(r"(?<![a-z0-9])" + re.escape(skill.lower()) + r"(?![a-z0-9])", text_lower))
@@ -464,9 +444,7 @@ def _validate_extraction_against_text(extraction: Dict[str, Any], cv_text: str) 
     return v
 
 
-# ── FIX 5: LLM multi-pass extraction ─────────────────────────────────────────
-# Cũ: single-pass 12k chars, lọc PII trước LLM → bỏ sót education trong personal block
-# Mới: ưu tiên section quan trọng, 16k chars, pass 2 targeted cho field còn thiếu
+# â”€â”€ LLM multi-pass extraction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _build_cv_text_full(chunks: List[Dict], max_chars: int = 16000) -> str:
     _RE_PRI = re.compile(r"\b(experience|education|skill|project|employment|work|intern|academic)\b", re.IGNORECASE)
@@ -488,9 +466,12 @@ def _llm_call(prompt: str) -> str:
     try:
         from local_llm import generate_answer
         return generate_answer(prompt)
-    except Exception as e:
-        log.warning("LLM extraction failed: %s", e)
-        return ""
+    except Exception:
+        try:
+            from local_llm import generate_answer
+            return generate_answer(prompt)
+        except Exception:
+            return ""
 
 def _parse_array_response(raw: str, allowed_keys: List[str]) -> List[Dict]:
     obj = _extract_json_object(f'{{"_": {raw.strip()}}}')
@@ -506,13 +487,12 @@ def _parse_array_response(raw: str, allowed_keys: List[str]) -> List[Dict]:
 
 def _parse_string_array_response(raw: str) -> List[str]:
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.IGNORECASE)
-    candidates = [raw]
-    m = re.search(r"\[.*\]", raw, re.DOTALL)
-    if m:
-        candidates.append(m.group(0))
     obj = _extract_json_object(raw)
     if obj:
         return _clean_string_list(obj.get("technical_skills") or obj.get("skills") or obj.get("_"))
+    m = re.search(r"\[.*\]", raw, re.DOTALL)
+    candidates = [m.group(0)] if m else []
+    candidates.append(raw)
     for candidate in candidates:
         try:
             arr = json.loads(candidate)
@@ -525,8 +505,8 @@ def _parse_string_array_response(raw: str) -> List[str]:
 _PROMPT_FULL = """Extract structured facts from this CV. Return ONLY valid JSON, no markdown.
 
 RULES: Only extract info explicitly written. Do NOT hallucinate. Empty field -> [] or null.
-technical_skills: word-for-word tools/languages/frameworks/testing methods/QA tools mentioned anywhere, including Experience and Projects.
-soft_skills: only human traits such as responsibility, teamwork, communication, curiosity.
+technical_skills: ALL tools/languages/frameworks/testing methods/QA tools found anywhere in the CV including Experience and Projects sections.
+soft_skills: only human traits (responsibility, teamwork, communication, curiosity, etc.).
 total_experience_years: sum explicit durations only, else null.
 companies: only explicitly named orgs, NOT from Summary/Objective.
 
@@ -545,23 +525,23 @@ _PROMPT_EXP = """Previous extraction missed work experience. Extract ONLY compan
 Return ONLY a JSON array: [{{"name":"","role":"","duration":"","years":0,"skills":[]}}]
 CV:\n{cv_text}"""
 
-_PROMPT_SKILLS = """Extract ONLY technical skills from this CV.
-Include tools, technologies, programming languages, frameworks, databases, platforms, QA/testing methods, and skills found in Experience/Projects/Objective sections.
-Do NOT include soft skills/personality traits.
+_PROMPT_SKILLS = """Extract ALL technical skills from this CV.
+Include: tools, technologies, languages, frameworks, databases, platforms, QA/testing methods.
+Look in ALL sections especially Experience, Projects, Objective.
+Do NOT include soft skills or personality traits.
 Return ONLY a JSON array of strings.
 CV:\n{cv_text}"""
 
 def _local_llm_extract_cv_facts(chunks: List[Dict], max_chars: int = 16000) -> Dict[str, Any]:
     if not chunks:
-        return _empty_cv_extraction()
-    heuristic = _heuristic_extract_cv_facts(chunks)
+        return EMPTY_CV_EXTRACTION.copy()
     cv_text = _build_cv_text_full(chunks, max_chars=max_chars)
 
-    # Pass 1: full extraction
+    # Pass 1
     extraction = _normalize_extraction(_extract_json_object(_llm_call(_PROMPT_FULL.format(cv_text=cv_text))))
     extraction = _validate_extraction_against_text(extraction, cv_text)
 
-    # Pass 2: targeted re-extraction cho field còn thiếu
+    # Pass 2: targeted
     if not extraction.get("education"):
         edu = _parse_array_response(_llm_call(_PROMPT_EDU.format(cv_text=cv_text)),
                                     ["school","degree","major","gpa","duration"])
@@ -574,6 +554,7 @@ def _local_llm_extract_cv_facts(chunks: List[Dict], max_chars: int = 16000) -> D
             validated = [c for c in exp if c.get("name") and _company_name_matches(c["name"], cv_text)]
             extraction["companies"] = validated or exp
 
+    # Skills pass luÃ´n cháº¡y Ä‘á»ƒ bá»• sung
     targeted_skills = _parse_string_array_response(_llm_call(_PROMPT_SKILLS.format(cv_text=cv_text)))
     if targeted_skills:
         extraction["technical_skills"] = _dedupe_strings(
@@ -582,119 +563,112 @@ def _local_llm_extract_cv_facts(chunks: List[Dict], max_chars: int = 16000) -> D
             limit=80,
         )
 
-    return _merge_extracted_skills(_merge_cv_extractions(extraction, heuristic), chunks)
+    extraction = _finalize_experience_extraction(extraction, cv_text)
+    return _merge_extracted_skills(extraction, chunks)
+
+def _llm_extract_chunk_skills(chunk: Dict) -> List[str]:
+    try:
+        from local_llm import extract_normalized_skills
+
+        return _dedupe_strings(
+            extract_normalized_skills(
+                chunk.get("text", ""),
+                source_type="CV",
+                section=str(chunk.get("section") or "unknown"),
+            ),
+            limit=40,
+        )
+    except Exception:
+        return []
+
+def _build_skill_text(skills: List[str], label: str = "CV_SKILLS") -> str:
+    try:
+        from local_llm import build_skill_text
+
+        return build_skill_text(skills, label=label)
+    except Exception:
+        return "\n".join(f"- {skill}" for skill in skills if skill)
 
 
-# ── Section detection & chunk enrichment ─────────────────────────────────────
+# â”€â”€ Section detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _normalized_cv_section(chunk: Dict) -> str:
-    label = _label_for_chunk(chunk).lower()
-    body = chunk.get("text", "").lower()
-    text = f"{label}\n{body[:800]}"
+    text = _label_for_chunk(chunk).lower()
     if re.search(r"\b(education|academic|university|college|school|gpa|degree)\b", text): return "education"
     if re.search(r"\b(project|portfolio)\b", text): return "projects"
     if re.search(r"\b(objective|summary)\b", text): return "general"
-    if re.search(r"\b(experience|employment|work|career|intern|internship|company|qa|qc|tester)\b", text): return "experience"
+    if re.search(r"\b(experience|employment|work|career|intern|internship|company|qa|qc|tester|engineer|developer)\b", text): return "experience"
     if _is_soft_skill_section_label(text): return "soft_skills"
     if re.search(r"\b(skills?|technical|tools?|technology|competenc|strength)\b", text): return "skills"
     return "general"
+
+
+# â”€â”€ Per-chunk enrichment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _matching_projects_for_chunk(chunk: Dict, extraction: Dict[str, Any]) -> List[Dict]:
     haystack = " ".join([chunk.get("section",""), *chunk.get("headings",[]), chunk.get("text","")[:200]]).lower()
     return [p for p in extraction.get("projects", [])
             if (name := str(p.get("name","")).lower()) and name in haystack]
 
-def _chunk_extracted_soft_skills(chunk: Dict, extraction: Dict[str, Any]) -> List[str]:
-    text_lower = chunk.get("text", "").lower()
-    from_extraction = [
-        skill for skill in extraction.get("soft_skills", [])
-        if _contains_skill(text_lower, skill)
-    ]
-    from_catalog = _find_catalog_matches(chunk.get("text", ""), _SOFT_SKILL_PATTERNS, limit=30)
-    return _dedupe_strings(from_extraction + from_catalog, limit=30)
-
-def _chunk_education(chunk: Dict, extraction: Dict[str, Any]) -> List[Dict[str, Any]]:
-    local = _heuristic_extract_education([chunk])
-    text_lower = chunk.get("text", "").lower()
-    matched = []
-    for row in extraction.get("education", []):
-        school = str(row.get("school", "")).lower()
-        gpa = str(row.get("gpa", "")).lower()
-        major = str(row.get("major", "")).lower()
-        if (school and school in text_lower) or (gpa and gpa in text_lower) or (major and major in text_lower):
-            matched.append(row)
-    return _dedupe_dicts(matched + local, ["school", "degree", "major", "gpa", "duration"])
-
 def _chunk_extracted_skills(chunk: Dict, extraction: Dict[str, Any]) -> List[str]:
-    text = chunk.get("text", "")
+    text    = chunk.get("text", "")
     section = _normalized_cv_section(chunk)
-    skills: List[str] = []
 
+    # Táº§ng A+B: extract tá»« text cá»§a chunk
+    skills = _clean_string_list(chunk.get("llm_skills"), limit=40)
+
+    # ThÃªm skills tá»« global extraction náº¿u xuáº¥t hiá»‡n trong text chunk
     for skill in extraction.get("technical_skills", []):
         if _contains_skill(text.lower(), skill):
             skills.append(skill)
-    skills.extend(_find_catalog_matches(text, _TECH_SKILL_PATTERNS, limit=80))
 
-    if section == "projects":
-        for project in _matching_projects_for_chunk(chunk, extraction) or extraction.get("projects", []):
-            skills.extend(_clean_string_list(project.get("technologies"), limit=20))
-
-    chunk_label = " ".join([chunk.get("section",""), *chunk.get("headings",[]), text[:300]])
+    # ThÃªm skills tá»« company.skills náº¿u company match chunk nÃ y
+    chunk_label_full = " ".join([chunk.get("section",""), *chunk.get("headings",[]), text[:300]])
     for company in extraction.get("companies", []):
-        if company.get("name") and _company_name_matches(company["name"], chunk_label):
+        if company.get("name") and _company_name_matches(company["name"], chunk_label_full):
             skills.extend(_clean_string_list(company.get("skills"), limit=20))
+
+    # ThÃªm technologies tá»« project match
+    if section == "projects":
+        for project in (_matching_projects_for_chunk(chunk, extraction) or extraction.get("projects", [])):
+            skills.extend(_clean_string_list(project.get("technologies"), limit=20))
 
     return _dedupe_strings(skills, limit=40)
 
 def _chunk_relevant_extraction(chunk: Dict, extraction: Dict[str, Any]) -> Dict[str, Any]:
     section  = _normalized_cv_section(chunk)
-    relevant = _empty_cv_extraction()
+    relevant = EMPTY_CV_EXTRACTION.copy()
+
+    # chunk_skills luÃ´n cÃ³, Ä‘á»™c láº­p vá»›i section type
     chunk_skills = _chunk_extracted_skills(chunk, extraction)
-    chunk_soft_skills = _chunk_extracted_soft_skills(chunk, extraction)
-    chunk_education = _chunk_education(chunk, extraction)
     if chunk_skills:
-        relevant["chunk_skills"] = chunk_skills
-    if chunk_soft_skills:
-        relevant["soft_skills"] = chunk_soft_skills
-    if chunk_education:
-        relevant["education"] = chunk_education
+        relevant["chunk_skills"] = chunk_skills   # key ngoÃ i schema, chá»‰ dÃ¹ng trong pipeline
 
     if section == "skills":
         relevant["technical_skills"] = extraction.get("technical_skills", [])
-        relevant["soft_skills"] = _dedupe_strings(
-            relevant.get("soft_skills", []) + extraction.get("soft_skills", []), limit=30
-        )
+        relevant["soft_skills"]       = extraction.get("soft_skills", [])
 
     elif section == "soft_skills":
-        relevant["soft_skills"] = _dedupe_strings(
-            relevant.get("soft_skills", []) + extraction.get("soft_skills", []), limit=30
-        )
+        relevant["soft_skills"] = extraction.get("soft_skills", [])
 
     elif section == "experience":
         chunk_label = " ".join([chunk.get("section",""), *chunk.get("headings",[]), chunk.get("text","")[:300]])
         matched = [c for c in extraction.get("companies", [])
                    if c.get("name") and _company_name_matches(c["name"], chunk_label)]
         relevant["companies"] = matched
-        if matched: relevant["total_experience_years"] = extraction.get("total_experience_years")
+        relevant.update(_chunk_experience_metadata(chunk))
 
     elif section == "projects":
         matched = _matching_projects_for_chunk(chunk, extraction)
         relevant["projects"] = matched or extraction.get("projects", [])
 
     elif section == "education":
-        relevant["education"] = _dedupe_dicts(
-            relevant.get("education", []) + extraction.get("education", []),
-            ["school", "degree", "major", "gpa", "duration"],
-        )
+        relevant["education"] = extraction.get("education", [])
 
     elif section == "general":
-        # FIX 2 extension: education ẩn trong general/personal block
-        if re.search(r"\b(university|college|school|degree|bachelor|master|phd|trường|đại\s+học)\b",
+        if re.search(r"\b(university|college|school|degree|bachelor|master|phd|trÆ°á»ng|Ä‘áº¡i\s+há»c)\b",
                      chunk.get("text", ""), re.IGNORECASE):
-            relevant["education"] = _dedupe_dicts(
-                relevant.get("education", []) + extraction.get("education", []),
-                ["school", "degree", "major", "gpa", "duration"],
-            )
+            relevant["education"] = extraction.get("education", [])
 
     return relevant
 
@@ -716,31 +690,28 @@ def _build_embedding_text(chunk: Dict, extraction: Dict[str, Any]) -> str:
     if section == "general" and ce.get("projects"): section = "projects"
 
     lines = [chunk.get("text", "")]
+    chunk_skills = ce.pop("chunk_skills", [])  # tÃ¡ch riÃªng, khÃ´ng format cÃ¹ng global fields
+
     if section == "skills":
         lines += _format_items("EXTRACTED SKILLS", ce.get("technical_skills", []))
         lines += _format_items("EXTRACTED SOFT SKILLS", ce.get("soft_skills", []))
-        lines += _format_items("EXTRACTED SKILLS FROM THIS SECTION", ce.get("chunk_skills", []))
+        lines += _format_items("EXTRACTED SKILLS FROM THIS SECTION", chunk_skills)
     elif section == "soft_skills":
         lines += _format_items("EXTRACTED SOFT SKILLS", ce.get("soft_skills", []))
     elif section == "experience":
-        lines += _format_items("EXTRACTED SKILLS FROM THIS EXPERIENCE", ce.get("chunk_skills", []))
-        if ce.get("total_experience_years") is not None:
-            lines.append(f"[EXTRACTED TOTAL EXPERIENCE YEARS]\n- {ce['total_experience_years']}")
+        lines += _format_items("EXTRACTED SKILLS FROM THIS EXPERIENCE", chunk_skills)
+        if ce.get("chunk_experience_months"):
+            lines.append(f"[EXTRACTED EXPERIENCE IN THIS CHUNK]\n- {ce.get('chunk_experience_duration', '0 years')}")
         lines += _format_items("EXTRACTED COMPANIES AND WORK EXPERIENCE", ce.get("companies", []))
     elif section == "projects":
-        lines += _format_items("EXTRACTED SKILLS FROM THIS PROJECT", ce.get("chunk_skills", []))
+        lines += _format_items("EXTRACTED SKILLS FROM THIS PROJECT", chunk_skills)
         lines += _format_items("EXTRACTED PROJECTS", ce.get("projects", []))
     elif section == "education":
-        lines += _format_items(f"EXTRACTED {section.upper()}", ce.get(section, []))
+        lines += _format_items("EXTRACTED EDUCATION", ce.get("education", []))
     elif section == "general" and ce.get("education"):
         lines += _format_items("EXTRACTED EDUCATION", ce["education"])
-
-    if section not in ("skills", "experience", "projects") and ce.get("chunk_skills"):
-        lines += _format_items("EXTRACTED SKILLS FROM THIS SECTION", ce["chunk_skills"])
-    if section not in ("skills", "soft_skills") and ce.get("soft_skills"):
-        lines += _format_items("EXTRACTED SOFT SKILLS", ce["soft_skills"])
-    if section not in ("education", "general") and ce.get("education"):
-        lines += _format_items("EXTRACTED EDUCATION", ce["education"])
+    elif chunk_skills:
+        lines += _format_items("EXTRACTED SKILLS FROM THIS SECTION", chunk_skills)
 
     return clean_text("\n\n".join(l for l in lines if l))
 
@@ -748,23 +719,41 @@ def enrich_chunks_for_embedding(chunks: List[Dict], *, use_llm: bool = True) -> 
     extraction = (
         _local_llm_extract_cv_facts(chunks)
         if use_llm
-        else _merge_extracted_skills(_heuristic_extract_cv_facts(chunks), chunks)
+        else _finalize_experience_extraction(
+            _merge_extracted_skills(EMPTY_CV_EXTRACTION.copy(), chunks),
+            _build_cv_text_full(chunks),
+        )
     )
-    enriched   = []
-    for chunk in chunks:
+    cv_experience = {
+        "months": extraction.get("total_experience_months", 0),
+        "years": extraction.get("total_experience_years", 0),
+        "display": extraction.get("experience_duration", "0 years"),
+    }
+    enriched = []
+    for index, chunk in enumerate(chunks):
         item = chunk.copy()
+        if index == 0:
+            item["cv_experience"] = cv_experience
+        item.update(_chunk_experience_metadata(item))
         if not _should_embed(chunk):
             item["skip_embed"] = True
         else:
+            if use_llm:
+                item["llm_skills"] = _llm_extract_chunk_skills(item)
             ce = _chunk_relevant_extraction(item, extraction)
-            compact = {k: v for k, v in ce.items() if v not in (None, "", [])}
+            # chunk_skills khÃ´ng thuá»™c EMPTY_CV_EXTRACTION nÃªn lá»c ra Ä‘á»ƒ lÆ°u vÃ o extracted_info
+            compact = {k: v for k, v in ce.items() if v not in (None, "", []) and k != "chunk_skills"}
+            chunk_skills = ce.get("chunk_skills", [])
+            if chunk_skills: compact["chunk_skills"] = chunk_skills
+            if chunk_skills:
+                item["skill_text"] = _build_skill_text(chunk_skills, label="CV_SKILLS")
             if compact: item["extracted_info"] = compact
             item["embedding_text"] = _build_embedding_text(item, extraction)
         enriched.append(item)
     return enriched
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# â”€â”€ Public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def cv_pdf_to_chunks(
     pdf_source: str | Path | bytes,
@@ -804,7 +793,67 @@ def cv_pdf_to_chunks(
         r["chunk_index"] = i
     return results
 
-cv_pdf_to_semantic_chunks = cv_pdf_to_chunks  # alias
+cv_pdf_to_semantic_chunks = cv_pdf_to_chunks
+
+def cv_chunk_text(chunk: Dict[str, Any] | Any, *, prefer_embedding: bool = False) -> str:
+    """
+    Shared CV chunk text accessor used by RAG and JD matching.
+
+    pdf_utils creates chunks with `text` and enriched `embedding_text`.
+    Mongo fallbacks may expose older chunks as `content`.
+    """
+    if not isinstance(chunk, dict):
+        return str(chunk or "")
+    if prefer_embedding:
+        return str(chunk.get("embedding_text") or chunk.get("text") or chunk.get("content") or "")
+    return str(chunk.get("text") or chunk.get("original_text") or chunk.get("content") or chunk.get("embedding_text") or "")
+
+
+def cv_chunk_embedding_text(chunk: Dict[str, Any] | Any) -> str:
+    return cv_chunk_text(chunk, prefer_embedding=True)
+
+
+def cv_chunk_skills(chunk: Dict[str, Any] | Any) -> List[str]:
+    """Return normalized skill names stored on an enriched CV chunk."""
+    if not isinstance(chunk, dict):
+        return []
+
+    skills: List[str] = []
+    info = chunk.get("extracted_info")
+    if isinstance(info, dict):
+        skills.extend(_clean_string_list(info.get("chunk_skills"), limit=80))
+        skills.extend(_clean_string_list(info.get("technical_skills"), limit=80))
+
+    skills.extend(_clean_string_list(chunk.get("llm_skills"), limit=80))
+
+    for line in str(chunk.get("skill_text") or "").splitlines():
+        line = line.strip()
+        if line.startswith("-"):
+            skills.append(line.strip("- ").strip())
+
+    return _dedupe_strings(skills, limit=80)
+
+
+def normalize_cv_chunks_for_matching(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Normalize current and legacy CV chunk shapes before JD matching.
+
+    The matcher can then rely on `text`, `embedding_text`, `section`,
+    `skill_text`, `extracted_info`, `skip_embed`, and `embedding`.
+    """
+    normalized: List[Dict[str, Any]] = []
+    for index, chunk in enumerate(chunks or []):
+        if not isinstance(chunk, dict):
+            chunk = {"text": str(chunk or "")}
+
+        item = dict(chunk)
+        item["section"] = str(item.get("section") or "unknown")
+        item["text"] = cv_chunk_text(item)
+        item["embedding_text"] = cv_chunk_embedding_text(item)
+        item["chunk_index"] = item.get("chunk_index", index)
+        normalized.append(item)
+    return normalized
+
 
 def pdf_to_markdown(
     pdf_source: str | Path | bytes,
@@ -827,7 +876,7 @@ def pdf_to_markdown(
     return md
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# â”€â”€ CLI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 if __name__ == "__main__":
     import argparse
@@ -859,7 +908,7 @@ if __name__ == "__main__":
             print(f"\nTotal chunks: {len(chunks)}\n")
             for c in chunks:
                 hdg = " > ".join(c["headings"]) or "(no heading)"
-                print(f"{'─'*60}\n#{c['chunk_index']}  section={c['section']}  [{hdg}]")
+                print(f"{'â”€'*60}\n#{c['chunk_index']}  section={c['section']}  [{hdg}]")
                 print(c["text"][:400] + ("..." if len(c["text"]) > 400 else ""))
     else:
         md = pdf_to_markdown(args.pdf, include_toc=args.toc, converter=conv)
