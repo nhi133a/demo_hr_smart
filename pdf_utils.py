@@ -1,4 +1,4 @@
-import json
+﻿import json
 import re
 import html
 import tempfile
@@ -12,15 +12,9 @@ from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.datamodel.base_models import InputFormat
 from docling.chunking import HybridChunker
 
-
-# â”€â”€ Converter â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
 def build_converter(*, ocr: bool = False, table_structure: bool = True) -> DocumentConverter:
     opts = PdfPipelineOptions(do_ocr=ocr, do_table_structure=table_structure)
     return DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)})
-
-
-# â”€â”€ Text helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def fix_spaced_letters(text: str) -> str:
     return re.sub(r'\b(?:[A-Z]\s){3,}[A-Z]\b', lambda m: m.group(0).replace(" ", ""), text)
@@ -32,9 +26,6 @@ def clean_text(text: str) -> str:
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
-
-# â”€â”€ Document loading â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
 def _load_document(pdf_source: str | Path | bytes, converter: DocumentConverter):
     if isinstance(pdf_source, bytes):
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
@@ -45,9 +36,6 @@ def _load_document(pdf_source: str | Path | bytes, converter: DocumentConverter)
         finally:
             os.unlink(tmp_path)
     return converter.convert(str(pdf_source)).document
-
-
-# â”€â”€ Chunk helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _merge_small_chunks(chunks: List[Dict], min_chars: int = 80, max_chars: int = 1200) -> List[Dict]:
     if not chunks:
@@ -62,9 +50,6 @@ def _merge_small_chunks(chunks: List[Dict], min_chars: int = 80, max_chars: int 
         else:
             merged.append(curr.copy())
     return merged
-
-
-# â”€â”€ PII / embed filtering â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 SKIP_EMBED_SECTIONS: set = {
     "contact information", "contact   information",
@@ -97,11 +82,9 @@ def _should_embed(chunk: Dict) -> bool:
     if not _is_pii_section(chunk):
         return True
     text = chunk.get("text", "")
-    # Chá»‰ embed PII block náº¿u chá»©a signal há»c vá»‹ rÃµ rÃ ng HOáº¶C signal experience/skill
     return bool(_RE_VALUABLE_EDU.search(text) or _RE_VALUABLE_OTHER.search(text))
 
 
-# â”€â”€ LLM extraction helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 EMPTY_CV_EXTRACTION: Dict[str, Any] = {
     "technical_skills": [], "soft_skills": [], "companies": [],
     "total_experience_years": None, "total_experience_months": 0,
@@ -219,7 +202,6 @@ def _extract_explicit_duration_months(text: str) -> int:
 
     return 0
 
-
 def _normalize_duration_words(text: str) -> str:
     numbers = {
         "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
@@ -243,19 +225,6 @@ def _finalize_experience_extraction(extraction: Dict[str, Any], cv_text: str) ->
     finalized["total_experience_years"] = _experience_years_for_matching(months)
     finalized["experience_duration"] = _experience_display(months)
     return finalized
-
-
-def _chunk_experience_metadata(chunk: Dict[str, Any]) -> Dict[str, Any]:
-    if _normalized_cv_section(chunk) != "experience":
-        return {}
-
-    months = _extract_total_experience_months(chunk.get("text", ""))
-    years = _experience_years_for_matching(months)
-    return {
-        "chunk_experience_months": months,
-        "chunk_experience_years": years,
-        "chunk_experience_duration": _experience_display(months),
-    }
 
 
 def _extract_date_intervals(text: str) -> List[tuple[int, int]]:
@@ -324,7 +293,6 @@ def _parse_end_date(value: str, current_index: int) -> int | None:
 
     return None
 
-
 def _month_name_to_number(value: str) -> int:
     months = {
         "jan": 1, "january": 1, "feb": 2, "february": 2,
@@ -362,9 +330,6 @@ def _dedupe_strings(items: List[str], limit: int = 40) -> List[str]:
             result.append(item); seen.add(item.lower())
     return result[:limit]
 
-
-# â”€â”€ Company fuzzy matching â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
 def _normalize_company_name(name: str) -> str:
     name = re.sub(
         r'\b(inc|llc|ltd|limited|corp|corporation|co|company|group|holdings?|'
@@ -380,9 +345,6 @@ def _company_name_matches(company_name: str, haystack: str) -> bool:
     tokens = [t for t in nn.split() if len(t) > 3]
     if not tokens: return company_name.lower() in haystack.lower()
     return sum(1 for t in tokens if t in nh) / len(tokens) >= 0.75
-
-
-# â”€â”€ Skill extraction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _RE_SOFT_SKILL_LABEL = re.compile(
     r"\b(strengths?|soft\s+skills?|personal\s+skills?|attributes?|qualities)\b",
@@ -424,9 +386,6 @@ def _merge_extracted_skills(extraction: Dict[str, Any], chunks: List[Dict]) -> D
     )
     return merged
 
-
-# â”€â”€ Validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
 def _contains_skill(text_lower: str, skill: str) -> bool:
     return bool(re.search(r"(?<![a-z0-9])" + re.escape(skill.lower()) + r"(?![a-z0-9])", text_lower))
 
@@ -444,7 +403,6 @@ def _validate_extraction_against_text(extraction: Dict[str, Any], cv_text: str) 
     return v
 
 
-# â”€â”€ LLM multi-pass extraction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _build_cv_text_full(chunks: List[Dict], max_chars: int = 16000) -> str:
     _RE_PRI = re.compile(r"\b(experience|education|skill|project|employment|work|intern|academic)\b", re.IGNORECASE)
@@ -554,7 +512,6 @@ def _local_llm_extract_cv_facts(chunks: List[Dict], max_chars: int = 16000) -> D
             validated = [c for c in exp if c.get("name") and _company_name_matches(c["name"], cv_text)]
             extraction["companies"] = validated or exp
 
-    # Skills pass luÃ´n cháº¡y Ä‘á»ƒ bá»• sung
     targeted_skills = _parse_string_array_response(_llm_call(_PROMPT_SKILLS.format(cv_text=cv_text)))
     if targeted_skills:
         extraction["technical_skills"] = _dedupe_strings(
@@ -590,8 +547,6 @@ def _build_skill_text(skills: List[str], label: str = "CV_SKILLS") -> str:
         return "\n".join(f"- {skill}" for skill in skills if skill)
 
 
-# â”€â”€ Section detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
 def _normalized_cv_section(chunk: Dict) -> str:
     text = _label_for_chunk(chunk).lower()
     if re.search(r"\b(education|academic|university|college|school|gpa|degree)\b", text): return "education"
@@ -603,8 +558,6 @@ def _normalized_cv_section(chunk: Dict) -> str:
     return "general"
 
 
-# â”€â”€ Per-chunk enrichment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
 def _matching_projects_for_chunk(chunk: Dict, extraction: Dict[str, Any]) -> List[Dict]:
     haystack = " ".join([chunk.get("section",""), *chunk.get("headings",[]), chunk.get("text","")[:200]]).lower()
     return [p for p in extraction.get("projects", [])
@@ -614,21 +567,17 @@ def _chunk_extracted_skills(chunk: Dict, extraction: Dict[str, Any]) -> List[str
     text    = chunk.get("text", "")
     section = _normalized_cv_section(chunk)
 
-    # Táº§ng A+B: extract tá»« text cá»§a chunk
     skills = _clean_string_list(chunk.get("llm_skills"), limit=40)
 
-    # ThÃªm skills tá»« global extraction náº¿u xuáº¥t hiá»‡n trong text chunk
     for skill in extraction.get("technical_skills", []):
         if _contains_skill(text.lower(), skill):
             skills.append(skill)
 
-    # ThÃªm skills tá»« company.skills náº¿u company match chunk nÃ y
     chunk_label_full = " ".join([chunk.get("section",""), *chunk.get("headings",[]), text[:300]])
     for company in extraction.get("companies", []):
         if company.get("name") and _company_name_matches(company["name"], chunk_label_full):
             skills.extend(_clean_string_list(company.get("skills"), limit=20))
 
-    # ThÃªm technologies tá»« project match
     if section == "projects":
         for project in (_matching_projects_for_chunk(chunk, extraction) or extraction.get("projects", [])):
             skills.extend(_clean_string_list(project.get("technologies"), limit=20))
@@ -639,7 +588,6 @@ def _chunk_relevant_extraction(chunk: Dict, extraction: Dict[str, Any]) -> Dict[
     section  = _normalized_cv_section(chunk)
     relevant = EMPTY_CV_EXTRACTION.copy()
 
-    # chunk_skills luÃ´n cÃ³, Ä‘á»™c láº­p vá»›i section type
     chunk_skills = _chunk_extracted_skills(chunk, extraction)
     if chunk_skills:
         relevant["chunk_skills"] = chunk_skills   # key ngoÃ i schema, chá»‰ dÃ¹ng trong pipeline
@@ -656,7 +604,9 @@ def _chunk_relevant_extraction(chunk: Dict, extraction: Dict[str, Any]) -> Dict[
         matched = [c for c in extraction.get("companies", [])
                    if c.get("name") and _company_name_matches(c["name"], chunk_label)]
         relevant["companies"] = matched
-        relevant.update(_chunk_experience_metadata(chunk))
+        relevant["total_experience_years"] = extraction.get("total_experience_years")
+        relevant["total_experience_months"] = extraction.get("total_experience_months", 0)
+        relevant["experience_duration"] = extraction.get("experience_duration", "0 years")
 
     elif section == "projects":
         matched = _matching_projects_for_chunk(chunk, extraction)
@@ -700,8 +650,8 @@ def _build_embedding_text(chunk: Dict, extraction: Dict[str, Any]) -> str:
         lines += _format_items("EXTRACTED SOFT SKILLS", ce.get("soft_skills", []))
     elif section == "experience":
         lines += _format_items("EXTRACTED SKILLS FROM THIS EXPERIENCE", chunk_skills)
-        if ce.get("chunk_experience_months"):
-            lines.append(f"[EXTRACTED EXPERIENCE IN THIS CHUNK]\n- {ce.get('chunk_experience_duration', '0 years')}")
+        if ce.get("total_experience_years") is not None:
+            lines.append(f"[EXTRACTED TOTAL EXPERIENCE]\n- {ce.get('experience_duration', '0 years')}")
         lines += _format_items("EXTRACTED COMPANIES AND WORK EXPERIENCE", ce.get("companies", []))
     elif section == "projects":
         lines += _format_items("EXTRACTED SKILLS FROM THIS PROJECT", chunk_skills)
@@ -730,18 +680,18 @@ def enrich_chunks_for_embedding(chunks: List[Dict], *, use_llm: bool = True) -> 
         "display": extraction.get("experience_duration", "0 years"),
     }
     enriched = []
-    for index, chunk in enumerate(chunks):
+    for chunk in chunks:
         item = chunk.copy()
-        if index == 0:
-            item["cv_experience"] = cv_experience
-        item.update(_chunk_experience_metadata(item))
+        item["cv_experience"] = cv_experience
+        item["total_experience_months"] = cv_experience["months"]
+        item["total_experience_years"] = cv_experience["years"]
+        item["experience_duration"] = cv_experience["display"]
         if not _should_embed(chunk):
             item["skip_embed"] = True
         else:
             if use_llm:
                 item["llm_skills"] = _llm_extract_chunk_skills(item)
             ce = _chunk_relevant_extraction(item, extraction)
-            # chunk_skills khÃ´ng thuá»™c EMPTY_CV_EXTRACTION nÃªn lá»c ra Ä‘á»ƒ lÆ°u vÃ o extracted_info
             compact = {k: v for k, v in ce.items() if v not in (None, "", []) and k != "chunk_skills"}
             chunk_skills = ce.get("chunk_skills", [])
             if chunk_skills: compact["chunk_skills"] = chunk_skills
@@ -751,9 +701,6 @@ def enrich_chunks_for_embedding(chunks: List[Dict], *, use_llm: bool = True) -> 
             item["embedding_text"] = _build_embedding_text(item, extraction)
         enriched.append(item)
     return enriched
-
-
-# â”€â”€ Public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def cv_pdf_to_chunks(
     pdf_source: str | Path | bytes,
@@ -796,12 +743,6 @@ def cv_pdf_to_chunks(
 cv_pdf_to_semantic_chunks = cv_pdf_to_chunks
 
 def cv_chunk_text(chunk: Dict[str, Any] | Any, *, prefer_embedding: bool = False) -> str:
-    """
-    Shared CV chunk text accessor used by RAG and JD matching.
-
-    pdf_utils creates chunks with `text` and enriched `embedding_text`.
-    Mongo fallbacks may expose older chunks as `content`.
-    """
     if not isinstance(chunk, dict):
         return str(chunk or "")
     if prefer_embedding:
@@ -814,7 +755,6 @@ def cv_chunk_embedding_text(chunk: Dict[str, Any] | Any) -> str:
 
 
 def cv_chunk_skills(chunk: Dict[str, Any] | Any) -> List[str]:
-    """Return normalized skill names stored on an enriched CV chunk."""
     if not isinstance(chunk, dict):
         return []
 
@@ -835,12 +775,6 @@ def cv_chunk_skills(chunk: Dict[str, Any] | Any) -> List[str]:
 
 
 def normalize_cv_chunks_for_matching(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Normalize current and legacy CV chunk shapes before JD matching.
-
-    The matcher can then rely on `text`, `embedding_text`, `section`,
-    `skill_text`, `extracted_info`, `skip_embed`, and `embedding`.
-    """
     normalized: List[Dict[str, Any]] = []
     for index, chunk in enumerate(chunks or []):
         if not isinstance(chunk, dict):
@@ -875,8 +809,6 @@ def pdf_to_markdown(
             md = "\n".join(toc) + "\n\n---\n\n" + md
     return md
 
-
-# â”€â”€ CLI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 if __name__ == "__main__":
     import argparse

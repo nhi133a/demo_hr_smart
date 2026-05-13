@@ -1,0 +1,214 @@
+[
+  {
+    "chunk_index": 0,
+    "section": "CAREER OBJECTIVE",
+    "text": "Motivated IT student seeking an IT Support / Helpdesk internship to apply practical knowledge in Windows Server, Active Directory, networking, and end-user troubleshooting. Eager to contribute to a stable IT environment and grow toward a System Administrator role.",
+    "headings": [
+      "CAREER OBJECTIVE"
+    ],
+    "extracted_info": {
+      "chunk_skills": [
+        "Windows Server",
+        "Active Directory"
+      ]
+    },
+    "embedding_text": "Motivated IT student seeking an IT Support / Helpdesk internship to apply practical knowledge in Windows Server, Active Directory, networking, and end-user troubleshooting. Eager to contribute to a stable IT environment and grow toward a System Administrator role.\n\n[EXTRACTED SKILLS FROM THIS SECTION]\n- Windows Server\n- Active Directory"
+  },
+  {
+    "chunk_index": 1,
+    "section": "EDUCATION",
+    "text": "Student of Engineering in Electronics and Telecommunications University of Science - VNU-HCM (2022-2026(expected)\nGPA: 7.87/10",
+    "headings": [
+      "EDUCATION"
+    ],
+    "extracted_info": {
+      "education": [
+        {
+          "school": "Student of Engineering in Electronics and Telecommunications University of Science - VNU-HCM",
+          "degree": "Bachelor's Degree",
+          "major": "Electronics and Telecommunications",
+          "gpa": 7.87,
+          "duration": "2022-2026(expected)"
+        }
+      ],
+      "chunk_skills": [
+        "Electronics and"
+      ]
+    },
+    "embedding_text": "Student of Engineering in Electronics and Telecommunications University of Science - VNU-HCM (2022-2026(expected)\nGPA: 7.87/10\n\n[EXTRACTED EDUCATION]\n- school: Student of Engineering in Electronics and Telecommunications University of Science - VNU-HCM; degree: Bachelor's Degree; major: Electronics and Telecommunications; gpa: 7.87; duration: 2022-2026(expected)"
+  },
+  {
+    "chunk_index": 2,
+    "section": "TECHNICAL SKILLS",
+    "text": "Operating Systems: Windows 10/11, Windows Server (basic understanding), Linux (Ubuntu)\nHardware & Devices: printer/scanner setup, peripheral troubleshooting\nSoftware & Tools: Microsoft Office (Excel, PowerPoint, Word), TeamViewer, Active Directory\nNetworking Fundamentals: TCP/IP, DNS, DHCP, LAN/Wi-Fi troubleshooting\nIT Service Management: Ticket handling, incident reporting, inventory tracking\nDocumentation & Reporting: User guides, work instructions, data preparation for reports\nLanguages: English - TOEIC : 745",
+    "headings": [
+      "TECHNICAL SKILLS"
+    ],
+    "extracted_info": {
+      "technical_skills": [
+        "Windows Server",
+        "Linux (Ubuntu)",
+        "Active Directory",
+        "DNS",
+        "GPO",
+        "File Server",
+        "RDP",
+        "VMware",
+        "Linux",
+        "printer/scanner setup",
+        "peripheral troubleshooting",
+        "Microsoft Office (Excel, PowerPoint, Word)",
+        "TeamViewer",
+        "TCP/IP",
+        "DHCP",
+        "LAN/Wi-Fi troubleshooting",
+        "Windows 10/11",
+        "Windows Server (basic understanding)",
+        "Networking Fundamentals: TCP/IP, DNS, DHCP, LAN/Wi-Fi troubleshooting",
+        "IT Service Management: Ticket handling, incident reporting, inventory tracking",
+        "Documentation & Reporting: User guides, work instructions, data preparation for reports",
+        "English - TOEIC : 745",
+        "Windows 10",
+        "11",
+        "printer",
+        "scanner setup",
+        "Microsoft Office (Excel",
+        "PowerPoint",
+        "Word)",
+        "TCP",
+        "IP",
+        "LAN",
+        "Wi-Fi troubleshooting",
+        "Ticket handling",
+        "incident reporting",
+        "inventory tracking",
+        "User guides",
+        "work instructions",
+        "data preparation for reports",
+        "OUs and",
+        "NTFS permissions",
+        "controlled user",
+        "Electronics and",
+        "collaboration",
+        "group settings.",
+        "resources and",
+        "and support",
+        "part-time sales",
+        "volunteer activities"
+      ],
+      "soft_skills": [
+        "Gained experience in collaboration, task sharing, and achieving common goals in group settings.",
+        "Adaptability: Learned to adjust plans and strategies flexibly depending on resources and situations.",
+        "Ability to communicate with and support users through part-time sales work.",
+        "Head of the Faculty's Arts and Culture Club",
+        "Participate in volunteer activities at school.",
+        "Eagerness to learn new technologies and tools"
+      ],
+      "chunk_skills": [
+        "Linux",
+        "Windows Server",
+        "Active Directory",
+        "DNS",
+        "printer/scanner setup",
+        "peripheral troubleshooting",
+        "Microsoft Office (Excel, PowerPoint, Word)",
+        "TeamViewer",
+        "TCP/IP",
+        "DHCP",
+        "LAN/Wi-Fi troubleshooting",
+        "Windows 10/11",
+        "Windows Server (basic understanding)",
+        "Networking Fundamentals: TCP/IP, DNS, DHCP, LAN/Wi-Fi troubleshooting",
+        "IT Service Management: Ticket handling, incident reporting, inventory tracking",
+        "Documentation & Reporting: User guides, work instructions, data preparation for reports",
+        "English - TOEIC : 745",
+        "Windows 10",
+        "11",
+        "printer",
+        "scanner setup",
+        "Microsoft Office (Excel",
+        "PowerPoint",
+        "Word)",
+        "TCP",
+        "IP",
+        "LAN",
+        "Wi-Fi troubleshooting",
+        "Ticket handling",
+        "incident reporting",
+        "inventory tracking",
+        "User guides",
+        "work instructions",
+        "data preparation for reports"
+      ]
+    },
+    "embedding_text": "Operating Systems: Windows 10/11, Windows Server (basic understanding), Linux (Ubuntu)\nHardware & Devices: printer/scanner setup, peripheral troubleshooting\nSoftware & Tools: Microsoft Office (Excel, PowerPoint, Word), TeamViewer, Active Directory\nNetworking Fundamentals: TCP/IP, DNS, DHCP, LAN/Wi-Fi troubleshooting\nIT Service Management: Ticket handling, incident reporting, inventory tracking\nDocumentation & Reporting: User guides, work instructions, data preparation for reports\nLanguages: English - TOEIC : 745\n\n[EXTRACTED SKILLS]\n- Windows Server\n- Linux (Ubuntu)\n- Active Directory\n- DNS\n- GPO\n- File Server\n- RDP\n- VMware\n- Linux\n- printer/scanner setup\n- peripheral troubleshooting\n- Microsoft Office (Excel, PowerPoint, Word)\n- TeamViewer\n- TCP/IP\n- DHCP\n- LAN/Wi-Fi troubleshooting\n- Windows 10/11\n- Windows Server (basic understanding)\n- Networking Fundamentals: TCP/IP, DNS, DHCP, LAN/Wi-Fi troubleshooting\n- IT Service Management: Ticket handling, incident reporting, inventory tracking\n- Documentation & Reporting: User guides, work instructions, data preparation for reports\n- English - TOEIC : 745\n- Windows 10\n- 11\n- printer\n- scanner setup\n- Microsoft Office (Excel\n- PowerPoint\n- Word)\n- TCP\n- IP\n- LAN\n- Wi-Fi troubleshooting\n- Ticket handling\n- incident reporting\n- inventory tracking\n- User guides\n- work instructions\n- data preparation for reports\n- OUs and\n- NTFS permissions\n- controlled user\n- Electronics and\n- collaboration\n- group settings.\n- resources and\n- and support\n- part-time sales\n- volunteer activities\n\n[EXTRACTED SOFT SKILLS]\n- Gained experience in collaboration, task sharing, and achieving common goals in group settings.\n- Adaptability: Learned to adjust plans and strategies flexibly depending on resources and situations.\n- Ability to communicate with and support users through part-time sales work.\n- Head of the Faculty's Arts and Culture Club\n- Participate in volunteer activities at school.\n- Eagerness to learn new technologies and tools\n\n[EXTRACTED SKILLS FROM THIS SECTION]\n- Linux\n- Windows Server\n- Active Directory\n- DNS\n- printer/scanner setup\n- peripheral troubleshooting\n- Microsoft Office (Excel, PowerPoint, Word)\n- TeamViewer\n- TCP/IP\n- DHCP\n- LAN/Wi-Fi troubleshooting\n- Windows 10/11\n- Windows Server (basic understanding)\n- Networking Fundamentals: TCP/IP, DNS, DHCP, LAN/Wi-Fi troubleshooting\n- IT Service Management: Ticket handling, incident reporting, inventory tracking\n- Documentation & Reporting: User guides, work instructions, data preparation for reports\n- English - TOEIC : 745\n- Windows 10\n- 11\n- printer\n- scanner setup\n- Microsoft Office (Excel\n- PowerPoint\n- Word)\n- TCP\n- IP\n- LAN\n- Wi-Fi troubleshooting\n- Ticket handling\n- incident reporting\n- inventory tracking\n- User guides\n- work instructions\n- data preparation for reports"
+  },
+  {
+    "chunk_index": 3,
+    "section": "PROJECT",
+    "text": "Windows Server Lab - Classroom IT Infrastructure\nTools: VMware, Windows Server, Active Directory, GPO, DNS, File Server, RDP\nConfigured Active Directory with OUs and user groups, enforced security policies via GPO, set up DNS for internal resolution, and managed file access through NTFS permissions resulting in a centrally managed system with controlled user access across all machines.",
+    "headings": [
+      "PROJECT"
+    ],
+    "extracted_info": {
+      "chunk_skills": [
+        "OUs and",
+        "GPO",
+        "NTFS permissions",
+        "controlled user",
+        "Windows Server",
+        "Active Directory",
+        "DNS",
+        "File Server",
+        "RDP",
+        "VMware"
+      ]
+    },
+    "embedding_text": "Windows Server Lab - Classroom IT Infrastructure\nTools: VMware, Windows Server, Active Directory, GPO, DNS, File Server, RDP\nConfigured Active Directory with OUs and user groups, enforced security policies via GPO, set up DNS for internal resolution, and managed file access through NTFS permissions resulting in a centrally managed system with controlled user access across all machines.\n\n[EXTRACTED SKILLS FROM THIS PROJECT]\n- OUs and\n- GPO\n- NTFS permissions\n- controlled user\n- Windows Server\n- Active Directory\n- DNS\n- File Server\n- RDP\n- VMware"
+  },
+  {
+    "chunk_index": 4,
+    "section": "SOFT SKILLS AND ACTIVITIES",
+    "text": "Gained experience in collaboration, task sharing, and achieving common goals in group settings.\nAdaptability: Learned to adjust plans and strategies flexibly depending on resources and situations.\nAbility to communicate with and support users through part-time sales work.\nHead of the Faculty's Arts and Culture Club\nParticipate in volunteer activities at school.\nEagerness to learn new technologies and tools",
+    "headings": [
+      "SOFT SKILLS AND ACTIVITIES"
+    ],
+    "extracted_info": {
+      "soft_skills": [
+        "Gained experience in collaboration, task sharing, and achieving common goals in group settings.",
+        "Adaptability: Learned to adjust plans and strategies flexibly depending on resources and situations.",
+        "Ability to communicate with and support users through part-time sales work.",
+        "Head of the Faculty's Arts and Culture Club",
+        "Participate in volunteer activities at school.",
+        "Eagerness to learn new technologies and tools"
+      ],
+      "chunk_skills": [
+        "collaboration",
+        "group settings.",
+        "resources and",
+        "and support",
+        "part-time sales",
+        "volunteer activities"
+      ]
+    },
+    "embedding_text": "Gained experience in collaboration, task sharing, and achieving common goals in group settings.\nAdaptability: Learned to adjust plans and strategies flexibly depending on resources and situations.\nAbility to communicate with and support users through part-time sales work.\nHead of the Faculty's Arts and Culture Club\nParticipate in volunteer activities at school.\nEagerness to learn new technologies and tools\n\n[EXTRACTED SOFT SKILLS]\n- Gained experience in collaboration, task sharing, and achieving common goals in group settings.\n- Adaptability: Learned to adjust plans and strategies flexibly depending on resources and situations.\n- Ability to communicate with and support users through part-time sales work.\n- Head of the Faculty's Arts and Culture Club\n- Participate in volunteer activities at school.\n- Eagerness to learn new technologies and tools"
+  },
+  {
+    "chunk_index": 5,
+    "section": "LE THI PHUONG NHI",
+    "text": "APPLY FOR: IT INTERN",
+    "headings": [
+      "LE THI PHUONG NHI"
+    ],
+    "embedding_text": "APPLY FOR: IT INTERN"
+  },
+  {
+    "chunk_index": 6,
+    "section": "CONTACT:",
+    "text": "Phone:\n+84 399 439 752\nEmail:\nnhi133a@gmail.com\nAddress:\nDormitory Zone B, VNU-HCM, Thu Duc City, HCMC",
+    "headings": [
+      "CONTACT:"
+    ],
+    "skip_embed": true
+  }
+]

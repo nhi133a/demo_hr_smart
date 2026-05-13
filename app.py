@@ -14,7 +14,13 @@ from pymongo import MongoClient
 
 from jd_matcher import match_cv_to_jds
 from jd_store import SAMPLE_JDS, count_indexed_jds, ingest_jds
-from mongo_utils import count_documents, delete_documents_by_source, get_candidate_name, get_distinct_sources
+from mongo_utils import (
+    count_documents,
+    delete_documents_by_source,
+    get_candidate_name,
+    get_chunks_by_source_for_matching,
+    get_distinct_sources,
+)
 from rag_core import answer_question, process_multiple_pdfs
 
 load_dotenv()
@@ -234,25 +240,16 @@ with col_profile:
             if not active_cv:
                 st.warning("Please select a CV first.")
             else:
-                filled = [
-                    v
-                    for k, v in st.session_state.items()
-                    if k in fields and v and v not in ("-", "Not specified in the CV.")
-                ]
-                if not filled:
-                    st.warning("Please click **Generate Full Profile** first.")
-                else:
-                    with st.spinner("Matching CV against JDs..."):
-                        try:
-                            cv_chunks = [
-                                {"section": k.lower().replace(" & ", "_"), "text": v}
-                                for k, v in st.session_state.items()
-                                if k in fields and v and v not in ("-", "Not specified in the CV.")
-                            ]
+                with st.spinner("Matching CV against JDs..."):
+                    try:
+                        cv_chunks = get_chunks_by_source_for_matching(active_cv)
+                        if not cv_chunks:
+                            st.warning("No indexed chunks found for this CV. Please upload/index it again.")
+                        else:
                             matches = match_cv_to_jds(cv_chunks, top_k=1)
                             st.session_state["jd_matches"] = matches
-                        except Exception as e:
-                            st.error(f"Matching error: {e}")
+                    except Exception as e:
+                        st.error(f"Matching error: {e}")
 
     if st.session_state["jd_matches"]:
         first_match = st.session_state["jd_matches"][0]
@@ -261,7 +258,7 @@ with col_profile:
         if cv_profile:
             st.markdown("**CV Profile (Auto-detected)**")
             p1, p2, p3 = st.columns(3)
-            p1.metric("Experience", f"{cv_profile.get('experience_years', 0)} yrs")
+            p1.metric("Experience", cv_profile.get("experience_duration") or f"{cv_profile.get('experience_years', 0)} yrs")
             p2.metric("Level", cv_profile.get("experience_level", "-"))
             p3.metric("Skills", f"{cv_profile.get('total_skills', 0)} found")
             st.markdown("---")

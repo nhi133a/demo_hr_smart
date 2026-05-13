@@ -1,10 +1,14 @@
 streamlit
 boto3
-openai
 pymongo
 PyPDF2
 python-dotenv
+openai
 PyMuPDF
 elevenlabs
 pydub
 ffmpeg
+langchain-aws
+langchain-chroma
+langchain-core
+langchain-ollama

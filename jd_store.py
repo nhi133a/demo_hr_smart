@@ -60,12 +60,6 @@ JD_SECTION_ALIASES = {
     "benefits": "benefits",
     "benefit": "benefits",
 }
-
-
-# =============================================================================
-# SAMPLE JDs — mỗi JD có sections riêng biệt
-# =============================================================================
-
 SAMPLE_JDS = [
     {
         "id":    "jd_001",
@@ -359,6 +353,50 @@ def search_jds_by_section(query_embedding: list, section: str, k: int = 3) -> Li
     return list(collection.aggregate(pipeline))
 
 
+def search_similar_jd_skills(query_embedding: list, k: int = 5) -> List[Dict]:
+    """
+    Search JD chunks that are most useful for skill matching.
+
+    The matcher uses this as a second pass with CV skill-only text. Prefer the
+    skills section, but keep requirements/experience in the search because many
+    JDs describe required skills outside a dedicated Skills header.
+    """
+    collection = get_jd_store()
+    skill_sections = {"skills", "requirements", "experience"}
+    pipeline = [
+        {
+            "$vectorSearch": {
+                "index":          VECTOR_INDEX_NAME,
+                "path":           "embedding",
+                "queryVector":    query_embedding,
+                "numCandidates":  min(max(k * 12, 60), 200),
+                "limit":          k * 4,
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "chunk_id": 1,
+                "jd_id": 1,
+                "title": 1,
+                "source": 1,
+                "section": 1,
+                "chunk_index": 1,
+                "content": 1,
+                "embedding_text": 1,
+                "llm_skills": 1,
+                "score": {"$meta": "vectorSearchScore"},
+            }
+        },
+    ]
+    hits = list(collection.aggregate(pipeline))
+    preferred = [
+        hit for hit in hits
+        if str(hit.get("section") or "").strip().lower() in skill_sections
+    ]
+    return (preferred or hits)[:k]
+
+
 def get_top_jd_ids(query_embedding: list, k: int = 3) -> List[str]:
     """
     Trả về jd_id của top k JD phù hợp nhất (không trùng lặp).
@@ -392,6 +430,8 @@ def get_jd_chunks(jd_id: str) -> List[Dict]:
             "section": 1,
             "chunk_index": 1,
             "content": 1,
+            "embedding_text": 1,
+            "llm_skills": 1,
         },
     ).sort("chunk_index", 1))
 

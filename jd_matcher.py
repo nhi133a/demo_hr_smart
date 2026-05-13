@@ -106,7 +106,14 @@ def extract_cv_profile(cv_chunks: List[Dict]) -> Dict[str, Any]:
                 if line.strip().startswith("-")
             )
     found_skills = list(dict.fromkeys(s for s in found_skills if s))
-    experience_years  = _calculate_experience_years(full_text)
+    stored_experience = _stored_cv_experience(cv_chunks)
+    if stored_experience:
+        experience_years = float(stored_experience.get("years") or 0)
+        experience_duration = str(stored_experience.get("display") or _format_experience_duration(experience_years))
+    else:
+        experience_years = _calculate_experience_years(full_text)
+        experience_duration = _format_experience_duration(experience_years)
+
     experience_level  = (
         "Senior"       if experience_years >= 5 else
         "Mid-level"    if experience_years >= 2 else
@@ -117,6 +124,7 @@ def extract_cv_profile(cv_chunks: List[Dict]) -> Dict[str, Any]:
         "skills":          found_skills[:15],
         "total_skills":    len(found_skills),
         "experience_years": experience_years,
+        "experience_duration": experience_duration,
         "experience_level": experience_level,
     }
 
@@ -125,7 +133,7 @@ def build_cv_summary(cv_chunks: List[Dict], cv_profile: Dict) -> str:
     relevant    = extract_relevant_sections(cv_chunks)
     profile_str = (
         f"[CV PRE-PROCESSED SUMMARY]\n"
-        f"Experience Level : {cv_profile['experience_level']} ({cv_profile['experience_years']} years)\n"
+        f"Experience Level : {cv_profile['experience_level']} ({cv_profile.get('experience_duration', '0 years')})\n"
         f"Technical Skills : {cv_profile['total_skills']} skills detected\n"
         f"Key Skills       : {', '.join(cv_profile['skills']) if cv_profile['skills'] else 'None'}"
     )
@@ -476,7 +484,7 @@ def _required_experience_years(jd_content: str) -> int | None:
     return None
 
 
-def _score_experience_for_jd(jd_content: str, cv_years: int) -> int | None:
+def _score_experience_for_jd(jd_content: str, cv_years: float) -> int | None:
     required_years = _required_experience_years(jd_content)
     if required_years is None:
         return None
@@ -564,7 +572,7 @@ def _postprocess_evaluation(
         fixed["technical_score"] = 40
     fixed["technical_score"] = _clamp_score(fixed.get("technical_score", 0), 40)
 
-    experience_score = _score_experience_for_jd(jd_content, int(cv_profile.get("experience_years") or 0))
+    experience_score = _score_experience_for_jd(jd_content, float(cv_profile.get("experience_years") or 0))
     if experience_score is not None:
         fixed["experience_score"] = experience_score
 
@@ -689,6 +697,34 @@ def match_cv_to_jds(cv_chunks: List[Dict], top_k: int = 1) -> List[Dict]:
 # DATE / EXPERIENCE HELPERS (giữ nguyên)
 # =============================================================================
 
+def _stored_cv_experience(cv_chunks: List[Dict]) -> Dict[str, Any] | None:
+    for chunk in cv_chunks:
+        if not isinstance(chunk, dict):
+            continue
+        cv_experience = chunk.get("cv_experience")
+        if isinstance(cv_experience, dict):
+            return cv_experience
+    return None
+
+
+def _years_from_months(months: int) -> float:
+    if months <= 0:
+        return 0
+    if months < 12:
+        return round(months / 12, 2)
+    return float(round(months / 12))
+
+
+def _format_experience_duration(years: float) -> str:
+    if years <= 0:
+        return "0 years"
+    months = round(years * 12)
+    if months < 12:
+        return f"{months} month" + ("" if months == 1 else "s")
+    rounded_years = round(years)
+    return f"{rounded_years} year" + ("" if rounded_years == 1 else "s")
+
+
 def _calculate_experience_years(text: str) -> int:
     intervals = _extract_date_intervals(text)
     if intervals:
@@ -714,7 +750,7 @@ def _extract_date_intervals(text: str) -> List[tuple[int, int]]:
         r"nov(?:ember)?|dec(?:ember)?"
     )
     separator  = r"(?:-|–|—|to|until|through)"
-    end_token  = rf"(?:{month_names}\s+\d{{4}}|\d{{1,2}}/\d{{4}}|\d{{4}}|present|current|now|ongoing)"
+    end_token  = rf"(?:(?:{month_names})\s+\d{{4}}|\d{{1,2}}/\d{{4}}|\d{{4}}|present|current|now|ongoing)"
     patterns   = [
         rf"(?P<start_month>{month_names})\s+(?P<start_year>\d{{4}})\s*{separator}\s*(?P<end>{end_token})",
         rf"(?P<start_month_num>\d{{1,2}})/(?P<start_year_num>\d{{4}})\s*{separator}\s*(?P<end>{end_token})",
