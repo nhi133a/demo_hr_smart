@@ -1,9 +1,12 @@
-from pdf_utils import cv_pdf_to_semantic_chunks
-from bedrock_utils import get_embedding
-from local_llm import generate_answer
-from mongo_utils import insert_chunks, make_unique_source_name, search_similar_chunks
+from pathlib import Path
 import hashlib
 import logging
+
+from bedrock_utils import get_embedding
+from local_llm import generate_answer
+from mongo_utils import insert_chunks, make_unique_source_name, search_similar_chunks, upsert_candidate_profile
+from pdf_utils import convert_cv_pdf, cv_document_to_chunks, cv_markdown_to_chunks, extract_cv_schema
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -13,22 +16,18 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# =============================================================================
-# HELPERS
-# =============================================================================
-
 def _normalize_chunk(chunk) -> tuple[str, str]:
     if isinstance(chunk, dict):
-        section = chunk.get("section", "unknown")   # fix: đồng bộ với pdf_utils
-        text    = chunk.get("embedding_text") or chunk.get("text") or chunk.get("content") or str(chunk)
+        section = chunk.get("section", "unknown")
+        text = chunk.get("text") or chunk.get("content") or str(chunk)
     else:
-        section = "unknown"                          # fix: đồng bộ với pdf_utils
-        text    = str(chunk)
+        section = "unknown"
+        text = str(chunk)
     return section, text
 
 
-def _embed_chunks(chunks: list, filename: str) -> list[tuple[str, list]]:
-    embedded = []                                    # fix: khởi tạo list trước khi dùng
+def _embed_chunks(chunks: list, filename: str) -> list[tuple[str, list, dict]]:
+    embedded = []
     total = len(chunks)
 
     for i, chunk in enumerate(chunks, 1):
@@ -40,98 +39,117 @@ def _embed_chunks(chunks: list, filename: str) -> list[tuple[str, list]]:
 
         try:
             embedding = get_embedding(text)
-        except Exception as e:
-            log.warning("  [%d/%d] ⚠️  Embed thất bại, bỏ qua chunk: %s", i, total, e)
+        except Exception as exc:
+            log.warning("  [%d/%d] Embed failed, skipping chunk: %s", i, total, exc)
             continue
 
         log.info("  [%d/%d] embedding dim=%d", i, total, len(embedding))
 
         metadata = {"section": section}
         if isinstance(chunk, dict):
-            for key in (
-                "candidate_name",
-                "extracted_info",
-                "skill_text",
-                "skip_embed",
-                "headings",
-                "llm_skills",
-                "raw_llm_section",
-                "llm_section",
-                "cv_experience",
-                "chunk_experience_months",
-                "chunk_experience_years",
-                "chunk_experience_duration",
-            ):
+            for key in ("candidate_name", "headings"):
                 if key in chunk:
                     metadata[key] = chunk[key]
-
-            # Keep both the original chunk text and the enriched text that was
-            # embedded so JD matching can use the same chunking pass later.
-            if "text" in chunk:
-                metadata["original_text"] = chunk["text"]
-            if "embedding_text" in chunk:
-                metadata["embedding_text"] = chunk["embedding_text"]
 
         embedded.append((text, embedding, metadata))
 
     return embedded
 
 
-# =============================================================================
-# PUBLIC API
-# =============================================================================
+def index_cv(
+    cv_id: str,
+    schema: dict,
+    markdown_text: str,
+    *,
+    file_hash: str = None,
+    original_filename: str = None,
+    chunks: list | None = None,
+) -> int:
+    chunks = chunks or cv_markdown_to_chunks(markdown_text, schema)
+    log.info("Raw vector chunks for '%s': %d", cv_id, len(chunks))
 
-def process_pdf_and_store(pdf_bytes: bytes, filename: str) -> int:
-    file_hash = hashlib.sha256(pdf_bytes).hexdigest()
-    source_name = make_unique_source_name(filename, file_hash)
-    log.info("📄 Bắt đầu xử lý: %s (%d bytes)", filename, len(pdf_bytes))
-
-    chunks = cv_pdf_to_semantic_chunks(pdf_bytes)
-    log.info("✂️  %d chunk từ '%s'", len(chunks), filename)
-
-    embedded = _embed_chunks(chunks, filename)
-
-    log.info("💾 Lưu %d chunk vào MongoDB (source='%s')", len(embedded), filename)
+    upsert_candidate_profile(
+        cv_id,
+        schema,
+        file_hash=file_hash,
+        original_filename=original_filename,
+    )
+    embedded = _embed_chunks(chunks, original_filename or cv_id)
     insert_chunks(
         embedded,
-        source_name=source_name,
+        source_name=cv_id,
         file_hash=file_hash,
-        original_filename=filename,
+        original_filename=original_filename,
     )
-    log.info("✅ Hoàn tất '%s' — %d chunk", filename, len(embedded))
-
     return len(embedded)
 
 
-def process_multiple_pdfs(file_list) -> int:
-    log.info("📂 Bắt đầu xử lý %d file", len(file_list))
+def process_cv(file_path: str) -> dict:
+    path = Path(file_path)
+    file_bytes = path.read_bytes()
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    cv_id = make_unique_source_name(path.name, file_hash)
+
+    doc, markdown_text = convert_cv_pdf(path)
+
+    schema = extract_cv_schema(markdown_text)
+    schema.setdefault("candidate", {})["cv_id"] = cv_id
+    chunks = cv_document_to_chunks(doc, schema) if doc is not None else cv_markdown_to_chunks(markdown_text, schema)
+
+    index_cv(cv_id, schema, markdown_text, file_hash=file_hash, original_filename=path.name, chunks=chunks)
+    return schema
+
+
+def process_cv_bytes(pdf_bytes: bytes, filename: str) -> tuple[dict, int, str]:
+    file_hash = hashlib.sha256(pdf_bytes).hexdigest()
+    cv_id = make_unique_source_name(filename, file_hash)
+
+    doc, markdown_text = convert_cv_pdf(pdf_bytes)
+
+    schema = extract_cv_schema(markdown_text)
+    schema.setdefault("candidate", {})["cv_id"] = cv_id
+    chunks = cv_document_to_chunks(doc, schema) if doc is not None else cv_markdown_to_chunks(markdown_text, schema)
+    count = index_cv(cv_id, schema, markdown_text, file_hash=file_hash, original_filename=filename, chunks=chunks)
+    return schema, count, cv_id
+
+
+def process_pdf_and_store(pdf_bytes: bytes, filename: str) -> int:
+    _, count, _ = process_cv_bytes(pdf_bytes, filename)
+    return count
+
+
+def process_multiple_pdfs(file_list) -> tuple[int, list[str]]:
+    log.info("Processing %d files", len(file_list))
+    uploaded_sources: list[str] = []
     total = 0
 
     for idx, file in enumerate(file_list, 1):
-        log.info("── File %d/%d: %s", idx, len(file_list), file.name)
-        count = process_pdf_and_store(file.read(), file.name)
+        log.info("File %d/%d: %s", idx, len(file_list), file.name)
+        pdf_bytes = file.read()
+        _, count, source_name = process_cv_bytes(pdf_bytes, file.name)
         total += count
+        uploaded_sources.append(source_name)
 
-    log.info("🏁 Hoàn tất — tổng %d chunk", total)
-    return total
+    log.info("Completed: %d chunks", total)
+    return total, uploaded_sources
 
 
 def answer_question(question: str, k: int = 3, source_filter: str = None) -> str:
-    log.info("❓ Câu hỏi: %s", question)
-    log.info("   k=%d | source_filter=%s", k, source_filter or "tất cả CV")
+    log.info("Question: %s", question)
+    log.info("k=%d | source_filter=%s", k, source_filter or "all CVs")
 
     query_embedding = get_embedding(question)
-    log.info("   embedding dim=%d", len(query_embedding))
+    log.info("embedding dim=%d", len(query_embedding))
 
     results = search_similar_chunks(query_embedding, k=k, source_filter=source_filter)
-    log.info("   MongoDB trả về %d chunk", len(results))
+    log.info("MongoDB returned %d chunks", len(results))
 
     if not results:
-        log.warning("   ⚠️  Không tìm thấy chunk phù hợp")
+        log.warning("No relevant chunk found")
         return "No relevant content found. Try rephrasing your question."
 
     for i, doc in enumerate(results, 1):
-        log.info("   chunk %d: %s", i, str(doc["content"]).replace("\n", " ")[:80])
+        log.info("chunk %d: %s", i, str(doc["content"]).replace("\n", " ")[:80])
 
     context = "\n\n".join(str(doc["content"]) for doc in results)
     prompt = f"""Here is the information extracted from the CV:
@@ -141,7 +159,7 @@ def answer_question(question: str, k: int = 3, source_filter: str = None) -> str
 Based on the above, please answer concisely:
 {question}"""
 
-    log.info("   Calling local LLM...")           # fix: bỏ log Bedrock Claude sai
+    log.info("Calling local LLM...")
     answer = generate_answer(prompt)
-    log.info("   ✅ Trả lời: %s", answer[:120].replace("\n", " "))
+    log.info("Answer: %s", answer[:120].replace("\n", " "))
     return answer
