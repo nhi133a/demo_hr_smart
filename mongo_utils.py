@@ -17,6 +17,66 @@ MONGO_CLIENT_OPTS = {
 client     = MongoClient(os.getenv("MONGO_URI"), tlsCAFile=certifi.where(), **MONGO_CLIENT_OPTS)
 db         = client["aws_rag_db"]
 collection = db["documents"]
+profiles_collection = db["candidates_profile"]
+
+
+def get_profiles_collection():
+    return profiles_collection
+
+
+def _profile_skill_names(schema: dict) -> list[str]:
+    names = []
+    if not isinstance(schema, dict):
+        return names
+    for key in ("required_skills", "preferred_skills", "skills_must", "skills_nice"):
+        rows = schema.get(key)
+        for row in rows if isinstance(rows, list) else []:
+            if isinstance(row, dict) and row.get("name"):
+                names.append(str(row["name"]).strip())
+            elif isinstance(row, str) and row.strip():
+                names.append(row.strip())
+    seen = set()
+    result = []
+    for name in names:
+        key = name.lower()
+        if key and key not in seen:
+            seen.add(key)
+            result.append(name)
+    return result
+
+
+def upsert_candidate_profile(
+    source_name: str,
+    schema: dict,
+    *,
+    file_hash: str = None,
+    original_filename: str = None,
+) -> None:
+    candidate = schema.get("candidate", {}) if isinstance(schema, dict) else {}
+    months = int((schema or {}).get("experience_months") or 0) if isinstance(schema, dict) else 0
+    profile = {
+        "source": source_name,
+        "cv_schema": schema or {},
+        "candidate_name": candidate.get("name") or "",
+        "email": candidate.get("email") or "",
+        "phone": candidate.get("phone") or "",
+        "location": candidate.get("location") or "",
+        "skills": _profile_skill_names(schema or {}),
+        "experience_years": round(months / 12, 2) if months else float((schema or {}).get("total_experience_years") or 0),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    if file_hash:
+        profile["file_hash"] = file_hash
+    if original_filename:
+        profile["original_filename"] = original_filename
+    profiles_collection.update_one({"source": source_name}, {"$set": profile}, upsert=True)
+
+
+def get_candidate_profile(source_name: str) -> dict:
+    try:
+        return profiles_collection.find_one({"source": source_name}, {"_id": 0}) or {}
+    except Exception:
+        return {}
 
 
 def insert_chunks(chunks_with_embeddings, source_name, *, file_hash=None, original_filename=None):
@@ -24,6 +84,9 @@ def insert_chunks(chunks_with_embeddings, source_name, *, file_hash=None, origin
     Optimized batch insert with minimal processing
     """
     docs = []
+
+    profile = get_candidate_profile(source_name)
+    cv_schema = profile.get("cv_schema") if isinstance(profile, dict) else None
 
     for i, item in enumerate(chunks_with_embeddings):
         if len(item) == 3:
@@ -47,6 +110,10 @@ def insert_chunks(chunks_with_embeddings, source_name, *, file_hash=None, origin
 
         if metadata:
             doc.update(metadata)
+        if isinstance(cv_schema, dict) and cv_schema:
+            doc["cv_schema"] = cv_schema
+        if profile.get("candidate_name") and "candidate_name" not in doc:
+            doc["candidate_name"] = profile["candidate_name"]
 
         # Extract name only from first chunk for efficiency
         if i == 0 and "[NAME]" in chunk and "candidate_name" not in doc:
@@ -228,12 +295,14 @@ def delete_documents_by_source(source_name):
     return result.deleted_count
 
 
-@staticmethod
 def get_candidate_name(source_name: str) -> str | None:
     """
     Get candidate name directly from DB - optimized single query
     """
     try:
+        profile = get_candidate_profile(source_name)
+        if profile.get("candidate_name"):
+            return profile["candidate_name"]
         doc = collection.find_one(
             {"source": source_name, "candidate_name": {"$exists": True}},
             {"candidate_name": 1}

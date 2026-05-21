@@ -13,12 +13,20 @@ import json
 import logging
 import re
 import unicodedata
-import logging
+from collections import defaultdict
+from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Any, Dict, List
 
+from langchain_core.prompts import PromptTemplate
+
 from bedrock_utils import get_embedding
-from jd_store import count_indexed_jds, get_jd_chunks
+from jd_store import (
+    count_indexed_jds,
+    get_jd_chunks,
+    search_similar_jds,
+    search_similar_jd_skills,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1069,18 +1077,31 @@ def match_jd_to_cvs(
             evaluation["recommendation"] = "Not a fit"
             evaluation["summary"] = f"{evaluation.get('summary', '')} Filter flags: {'; '.join(reasons)}".strip()
             rerank_score = min(rerank_score, 44.0)
+        jd_data = {
+            "title": jd_title,
+            "weighted_score": score / 100,
+            "section_scores": section_scores,
+        }
         results.append({
-            "jd_id":            jid,
-            "jd_title":         jd_data["title"],
-            "similarity_score": round(min(1.0, jd_data["weighted_score"]) * 100, 1),
+            "cv_source": source,
+            "candidate_name": _candidate_name(source, cv_chunks, get_candidate_name),
+            "jd_id": jd_id,
+            "jd_title": jd_title,
+            "similarity_score": round(score, 1),
+            "dense_score": round(retrieval_score * 100, 1),
+            "bm25_score": round(section_scores.get("required_skills", 0), 1),
+            "cross_encoder_score": 0,
+            "rerank_score": rerank_score,
+            "rerank_method": "schema_score+rag_tiebreak",
+            "retrieval_method": retrieval_method,
             "section_scores":   jd_data["section_scores"],   # thêm mới: score từng section
             "evaluation":       evaluation,
             "cv_profile":       cv_profile,
         })
 
     # Bước 5: sort theo LLM score
-    results.sort(key=lambda x: x["evaluation"].get("score", 0), reverse=True)
-    return results
+    results.sort(key=lambda item: (item.get("rerank_score", 0), item["evaluation"].get("score", 0)), reverse=True)
+    return results[:target_k]
 
 
 # =============================================================================
