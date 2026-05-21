@@ -12,8 +12,8 @@ import streamlit as st
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
-from jd_matcher import match_cv_to_jds
-from jd_store import SAMPLE_JDS, count_indexed_jds, ingest_jds
+from jd_matcher import match_jd_to_cvs
+from jd_store import SAMPLE_JDS, count_indexed_jds, ingest_jd_text, ingest_jds, list_indexed_jds
 from mongo_utils import (
     count_documents,
     delete_documents_by_source,
@@ -68,6 +68,8 @@ if "chat_history" not in st.session_state:
     st.session_state["chat_history"] = []
 if "jd_matches" not in st.session_state:
     st.session_state["jd_matches"] = []
+if "cv_matches" not in st.session_state:
+    st.session_state["cv_matches"] = []
 if "last_active_cv" not in st.session_state:
     st.session_state["last_active_cv"] = None
 if "processed_upload_token" not in st.session_state:
@@ -78,6 +80,7 @@ def _reset_cv_state():
     for key in fields:
         st.session_state[key] = ""
     st.session_state["jd_matches"] = []
+    st.session_state["cv_matches"] = []
     st.session_state["chat_history"] = []
 
 
@@ -124,9 +127,10 @@ else:
         for file in uploaded_files:
             file.seek(0)
         with st.spinner(f"Indexing {len(uploaded_files)} CV(s)..."):
-            n = process_multiple_pdfs(uploaded_files)
+            total_chunks, uploaded_sources = process_multiple_pdfs(uploaded_files)
         st.session_state["processed_upload_token"] = upload_token
-        st.sidebar.success(f"Indexed {n} chunks from {len(uploaded_files)} CV(s)")
+        st.session_state["uploaded_sources_current_session"] = uploaded_sources
+        st.sidebar.success(f"Indexed {total_chunks} chunks from {len(uploaded_files)} CV(s)")
         get_cv_list.clear()
         st.rerun()
 
@@ -175,44 +179,15 @@ def generate_full_profile():
         st.warning("Please select a CV first.")
         return
 
+    # Tiết kiệm LLM: chỉ lấy Name (candidate_name) từ Mongo, không gọi answer_question cho các field khác.
     candidate_name = get_candidate_name(active_cv)
-    if candidate_name:
-        st.session_state["Name"] = candidate_name
-    else:
-        name_prompt = "What is the candidate's full name mentioned at the top of the CV?"
-        name_result = answer_question(name_prompt, k=3, source_filter=active_cv)
-        st.session_state["Name"] = name_result if "not" not in name_result.lower() else "Name not found"
+    st.session_state["Name"] = candidate_name or ""
 
-    progress = st.progress(0)
-    completed = 0
-    total_fields = len([f for f in fields.keys() if f != "Name"])
-
-    field_k_values = {
-        "Experience": 8,
-        "Skills & Tools": 5,
-        "Education": 4,
-        "Contact": 3,
-        "Languages": 3,
-        "Location": 2,
-        "Title": 3,
-        "Certifications": 4,
-        "Passion": 4,
-    }
-
-    for label, question in fields.items():
+    # Các field còn lại giữ mặc định (""), UI sẽ hiển thị "-"
+    for label in fields.keys():
         if label == "Name":
             continue
-
-        k_value = field_k_values.get(label, 3)
-        ans = answer_question(question, k=k_value, source_filter=active_cv)
-
-        if "Aucun contenu pertinent" in ans or "not specified" in ans.lower():
-            ans = "Not specified in the CV."
-
-        st.session_state[label] = ans
-        completed += 1
-        progress.progress(completed / total_fields)
-
+        st.session_state[label] = ""
 
 col_profile, col_chat = st.columns([2, 1])
 
@@ -226,55 +201,131 @@ with col_profile:
 
     st.button("Generate Full Profile", on_click=generate_full_profile)
 
-    data = {label: st.session_state[label] or "-" for label in fields}
-    df = pd.DataFrame.from_dict(data, orient="index", columns=["Value"])
-    st.table(df)
+    # Thẩm mỹ UI: chỉ hiển thị những field có giá trị thực sự (không phải "-"/rỗng)
+    non_empty = {}
+    for label in fields:
+        val = (st.session_state.get(label) or "").strip()
+        if not val or val == "-":
+            continue
+        non_empty[label] = val
+
+    if non_empty:
+        df = pd.DataFrame.from_dict(non_empty, orient="index", columns=["Value"])
+        st.table(df)
+    else:
+        st.caption("Chưa có dữ liệu profile (đang tiết kiệm LLM: chỉ lấy Name).")
 
     st.markdown("---")
-    st.header("JD Matching")
+    st.header("JD → Candidate CV Matching")
 
-    if jd_count == 0:
-        st.warning("No JDs indexed yet. Click **Index JDs** in the sidebar first.")
-    else:
-        if st.button("Find Best Matching JD"):
-            if not active_cv:
-                st.warning("Please select a CV first.")
+    st.caption("HR dán/paste JD (text) hoặc chọn JD có sẵn trong hệ thống. Hệ thống sẽ trả về top K CV phù hợp nhất (must-have/gap).")
+
+    top_k_cvs = st.number_input("Number of CVs to return", min_value=1, max_value=20, value=5, step=1)
+
+    jd_mode = st.radio(
+        "JD input mode",
+        options=["Paste JD text", "Use indexed/sample JD"],
+        index=1,
+        horizontal=True,
+    )
+
+    jd_text = ""
+    jd_id_for_call = None
+
+    match_scope = st.radio(
+        "Match CV scope",
+        options=["All indexed CVs", "Only the CVs uploaded in this session"],
+        index=1,
+        horizontal=True,
+    )
+
+    uploaded_sources = None
+    if match_scope == "Only the CVs uploaded in this session":
+        uploaded_sources = st.session_state.get("uploaded_sources_current_session") or []
+        if not uploaded_sources:
+            st.warning("No CVs were uploaded in this session yet. Upload CVs first.")
+
+    if jd_mode == "Paste JD text":
+        jd_title = st.text_input("JD title (optional)", placeholder="Example: Backend Developer Intern")
+        jd_text = st.text_area("Paste Job Description", height=220, placeholder="Dán nội dung JD vào đây...")
+        if st.button("Find Best Matching CVs (from pasted JD)"):
+            if not jd_text.strip():
+                st.error("JD text is empty.")
             else:
-                with st.spinner("Matching CV against JDs..."):
+                pasted_jd = None
+                with st.spinner("Chunking, embedding and storing pasted JD..."):
                     try:
-                        cv_chunks = get_chunks_by_source_for_matching(active_cv)
-                        if not cv_chunks:
-                            st.warning("No indexed chunks found for this CV. Please upload/index it again.")
-                        else:
-                            matches = match_cv_to_jds(cv_chunks, top_k=1)
-                            st.session_state["jd_matches"] = matches
+                        pasted_jd = ingest_jd_text(jd_text, title=jd_title)
+                        st.sidebar.success(
+                            f"Stored JD `{pasted_jd['jd_id']}` with {pasted_jd['chunk_count']} chunks"
+                        )
                     except Exception as e:
-                        st.error(f"Matching error: {e}")
+                        st.error(f"JD indexing error: {e}")
 
-    if st.session_state["jd_matches"]:
-        first_match = st.session_state["jd_matches"][0]
-        cv_profile = first_match.get("cv_profile", {})
+                if pasted_jd:
+                    with st.spinner("Matching pasted JD against indexed CVs..."):
+                        try:
+                            st.session_state["cv_matches"] = match_jd_to_cvs(
+                                pasted_jd["jd_id"],
+                                top_k=int(top_k_cvs),
+                                source_whitelist=uploaded_sources,
+                            )
+                        except Exception as e:
+                            st.error(f"Matching error: {e}")
+    else:
+        if jd_count == 0:
+            st.warning("No JDs indexed yet. Click **Index JDs** in the sidebar first.")
+        else:
+            try:
+                indexed_jds = list_indexed_jds()
+            except Exception:
+                indexed_jds = []
 
-        if cv_profile:
-            st.markdown("**CV Profile (Auto-detected)**")
-            p1, p2, p3 = st.columns(3)
-            p1.metric("Experience", cv_profile.get("experience_duration") or f"{cv_profile.get('experience_years', 0)} yrs")
-            p2.metric("Level", cv_profile.get("experience_level", "-"))
-            p3.metric("Skills", f"{cv_profile.get('total_skills', 0)} found")
-            st.markdown("---")
+            if indexed_jds:
+                jd_options = {
+                    f"{jd['title']} ({jd['jd_id']})": jd["jd_id"]
+                    for jd in indexed_jds
+                }
+                selected_jd_label = st.selectbox("Select JD to match candidates", list(jd_options.keys()))
 
-        for i, match in enumerate(st.session_state["jd_matches"]):
+                jd_id_for_call = jd_options[selected_jd_label]
+
+                if st.button("Find Best Matching CVs"):
+                    with st.spinner("Matching JD against indexed CVs..."):
+                        try:
+                            st.session_state["cv_matches"] = match_jd_to_cvs(
+                                jd_id_for_call,
+                                top_k=int(top_k_cvs),
+                                source_whitelist=uploaded_sources,
+                            )
+                        except Exception as e:
+                            st.error(f"Matching error: {e}")
+            else:
+                st.warning("JD chunks exist, but no grouped JD list was returned. Please re-index JDs.")
+
+
+    if st.session_state["cv_matches"]:
+        for i, match in enumerate(st.session_state["cv_matches"]):
             ev = match["evaluation"]
             score = ev.get("score", 0)
             badge = "GREEN" if score >= 70 else "YELLOW" if score >= 50 else "RED"
+            cv_profile = match.get("cv_profile", {})
 
             with st.expander(
-                f"{badge} #{i + 1} {match['jd_title']} - {score}/100",
+                f"{badge} #{i + 1} {match.get('candidate_name') or match.get('cv_source')} - {score}/100",
                 expanded=(i == 0),
             ):
-                if match.get("jd_id") == "error":
+                if match.get("cv_source") == "error":
                     st.error(ev.get("summary") or ev.get("match") or "JD matching failed.")
                     continue
+
+                st.caption(f"CV: **{match.get('cv_source')}** | JD: **{match.get('jd_title')}**")
+
+                if cv_profile:
+                    p1, p2, p3 = st.columns(3)
+                    p1.metric("Experience", cv_profile.get("experience_duration") or f"{cv_profile.get('experience_years', 0)} yrs")
+                    p2.metric("Level", cv_profile.get("experience_level", "-"))
+                    p3.metric("Skills", f"{cv_profile.get('total_skills', 0)} found")
 
                 st.markdown("**Score Breakdown**")
                 b1, b2, b3, b4 = st.columns(4)
@@ -303,8 +354,25 @@ with col_profile:
                 st.info(ev.get("summary", ""))
                 st.caption(
                     f"Recommendation: **{ev.get('recommendation', '')}** | "
-                    f"Vector Similarity: {match.get('similarity_score', 0)}%"
+                    f"Hybrid: {match.get('similarity_score', 0)}% | "
+                    f"Dense: {match.get('dense_score', 0)}% | "
+                    f"BM25: {match.get('bm25_score', 0)}% | "
+                    f"Rerank: {match.get('rerank_score', 0)}% "
+                    f"({match.get('rerank_method', 'rerank')})"
                 )
+
+                evidence = match.get("match_evidence") or []
+                if evidence:
+                    # Streamlit does not allow nesting expanders inside other expanders.
+                    st.markdown("**Retrieved CV Evidence**")
+                    for item in evidence[:5]:
+                        st.markdown(
+                            f"**JD {str(item.get('jd_section', 'unknown')).upper()}** "
+                            f"matched **CV {str(item.get('cv_section', 'unknown')).upper()}** "
+                            f"({float(item.get('score', 0)):.2f})"
+                        )
+                        st.caption(item.get("cv_text", ""))
+
 
 
 with col_chat:
