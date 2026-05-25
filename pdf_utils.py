@@ -126,6 +126,7 @@ RULES:
 - confidence: "high" (rõ ràng) | "medium" (suy luận nhưng chắc) | "low" (không chắc, bỏ qua)
 - Normalize tất cả equivalent skill names: "máy tính tiền" → "POS System"
 - Không output skill nếu confidence < "medium"
+- Không output job title, desired role, hoặc seniority label như "QA Intern" làm skill
 - evidence: short quote từ CV chứng minh skill/experience
 - quality_score: 0-100, đánh giá impact/complexity/technology của experience
 - total_experience_years: đọc toàn bộ CV và trả về tổng số năm kinh nghiệm làm việc trong section Experience
@@ -164,6 +165,26 @@ SCHEMA:
 }}
 
 OUTPUT: JSON ONLY."""
+
+CV_CHUNK_SKILL_AUDIT_PROMPT = """Bạn là CV skill auditor. Đọc các CV chunks dưới đây và trích xuất skill/tool/process được nêu rõ trong nội dung.
+
+RULES:
+- Chỉ lấy skill có bằng chứng trực tiếp trong chunk.
+- Không lấy job title, tên công ty, tên người, trường học, location, tính cách chung.
+- Không lấy skill quá chung như "testing" nếu chunk có cụm cụ thể hơn như "manual testing" hoặc "API testing".
+- Ưu tiên technical skill, tool, process, domain skill.
+- evidence phải là short quote nguyên văn từ chunk.
+- confidence: high nếu skill viết rõ; medium nếu suy ra trực tiếp từ hành động/cụm từ trong chunk; không output low.
+
+CV CHUNKS:
+{chunk_text}
+
+OUTPUT JSON ONLY:
+{{
+  "skills": [
+    {{"name": "", "type": "technical"|"tool"|"process"|"domain"|"soft", "confidence": "high"|"medium", "evidence": "", "source_chunk": 0}}
+  ]
+}}"""
 
 def _as_list(value: Any) -> List[Any]:
     return value if isinstance(value, list) else []
@@ -372,8 +393,6 @@ def _sum_experience_months(rows: List[Dict[str, Any]]) -> int:
             intervals.append((start, end))
             continue
 
-        # LLM is asked to output years plus leftover months. Accept old output
-        # that used total months as well so already indexed schemas still load.
         estimated_months = months if months > 12 else round(years * 12) + months
         if estimated_months <= 0:
             continue
@@ -488,6 +507,44 @@ def _clean_skill_rows(value: Any) -> List[Dict[str, Any]]:
         rows.append(row)
     return rows[:100]
 
+
+def _skill_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9+#]+", "", clean_text(value).lower())
+
+
+def _skill_evidence_in_text(skill: str, evidence: str, text: str) -> bool:
+    skill = clean_text(skill)
+    evidence = clean_text(evidence)
+    text_lower = clean_text(text).lower()
+    if not skill:
+        return False
+    if re.search(r"(?<![a-z0-9])" + re.escape(skill.lower()) + r"(?![a-z0-9])", text_lower):
+        return True
+    return bool(evidence and evidence.lower() in text_lower)
+
+
+def _merge_skill_rows(existing: List[Dict[str, Any]], additions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged = _clean_skill_rows(existing)
+    by_key = {_skill_key(row.get("name")): row for row in merged}
+    rank = {"": 0, "low": 1, "medium": 2, "high": 3}
+
+    for row in _clean_skill_rows(additions):
+        key = _skill_key(row.get("name"))
+        if not key:
+            continue
+        current = by_key.get(key)
+        if not current:
+            merged.append(row)
+            by_key[key] = row
+            continue
+        if rank.get(row.get("confidence", ""), 0) > rank.get(current.get("confidence", ""), 0):
+            current["confidence"] = row["confidence"]
+        if row.get("evidence") and not current.get("evidence"):
+            current["evidence"] = row["evidence"]
+        if row.get("type") and not current.get("type"):
+            current["type"] = row["type"]
+    return merged[:100]
+
 def _normalize_cv_schema(data: Dict[str, Any]) -> Dict[str, Any]:
     try:
         parsed = CVStructuredSchema.model_validate(data if isinstance(data, dict) else {})
@@ -504,9 +561,6 @@ def _normalize_cv_schema(data: Dict[str, Any]) -> Dict[str, Any]:
     )
     for row in experience_rows:
         row["years"] = round(_to_float(row.get("years"), 0.0), 2)
-        # Fix 3a: KHÔNG override months từ years ở đây
-        # _sum_experience_months tự xử lý logic months vs years
-        # chỉ đảm bảo months là int hợp lệ, giữ nguyên giá trị LLM trả
         if "months" in row:
             row["months"] = _to_int(row.get("months"), 0)
         row["quality_score"] = _score_100(row.get("quality_score", 0))
@@ -527,8 +581,6 @@ def _normalize_cv_schema(data: Dict[str, Any]) -> Dict[str, Any]:
         },
         "metadata_filter": {
             "education_min":  _normalize_enum(metadata_filter.get("education_min"), EDUCATION_LEVELS) or None,
-            # Fix 3b: exp_years_min luôn lấy từ Python-calculated experience_years
-            # KHÔNG dùng LLM infer — LLM suy từ seniority title, không phải dates thực tế
             "exp_years_min":  experience_years or None,
             "location":       clean_text(metadata_filter.get("location")) or None,
         },
@@ -632,9 +684,6 @@ def _experience_row_from_label(label: str) -> Optional[Dict[str, Any]]:
         ).strip(" -()|")
     title, _, company = title_company.partition(" - ")
 
-    # Docling can detach timeline rows from their job headings. For a bare
-    # timeline row only keep explicit duration text; an unlabelled date range
-    # may belong to Education or another adjacent block.
     if not title_company:
         if years <= 0 and months <= 0:
             return None
@@ -766,6 +815,247 @@ def extract_cv_schema(cv_text: str) -> Dict[str, Any]:
         schema["candidate"].update(_fallback_candidate_fields(cv_text))
 
     return schema
+
+
+def _format_chunks_for_skill_audit(chunks: List[Dict[str, Any]], max_chars: int = 12000) -> str:
+    parts: List[str] = []
+    total = 0
+    useful_sections = {"skills", "experience", "projects", "certifications"}
+    for chunk in chunks or []:
+        if not isinstance(chunk, dict):
+            continue
+        text = clean_text(chunk.get("text") or chunk.get("content") or chunk.get("embedding_text") or "")
+        if not text:
+            continue
+        section = normalize_section_label(str(chunk.get("section") or "unknown"))
+        if section not in useful_sections:
+            continue
+        header = f"[CHUNK {chunk.get('chunk_index', len(parts))} | section={section} | headings={', '.join(_as_list(chunk.get('headings')))}]"
+        item = f"{header}\n{text[:1800]}"
+        if total + len(item) > max_chars:
+            break
+        parts.append(item)
+        total += len(item)
+    return "\n\n".join(parts)
+
+
+def _canonical_chunk_skill_name(value: Any) -> str:
+    text = clean_text(value).strip(" -.;:,()[]")
+    if not text:
+        return ""
+    lowered = text.lower()
+    known = {
+        "api": "API",
+        "sql": "SQL",
+        "uat": "UAT",
+        "sdlc": "SDLC",
+        "ui": "UI",
+        "ux": "UX",
+    }
+    if lowered in known:
+        return known[lowered]
+    replacements = {
+        "api testing": "API Testing",
+        "manual testing": "Manual Testing",
+        "automation testing": "Automation Testing",
+        "functional testing": "Functional Testing",
+        "regression testing": "Regression Testing",
+        "uat testing": "UAT Testing",
+        "test case design": "Test Case Design",
+        "bug reporting": "Bug Reporting",
+        "bug tracking": "Bug Tracking",
+        "defect reporting": "Defect Reporting",
+        "test planning": "Test Planning",
+        "test execution": "Test Execution",
+        "requirements analysis": "Requirements Analysis",
+        "business requirements analysis": "Business Requirements Analysis",
+        "system analysis": "System Analysis",
+        "result validation": "Result Validation",
+        "web automation": "Web Automation",
+    }
+    return replacements.get(lowered, text if any(ch.isupper() for ch in text) else text.title())
+
+
+def _valid_chunk_skill_name(name: Any) -> bool:
+    text = clean_text(name)
+    if not text:
+        return False
+    lowered = text.lower()
+    if len(text) > 45:
+        return False
+    if lowered in {
+        "testing",
+        "test cases",
+        "developers",
+        "speaking",
+        "listening",
+        "reading",
+        "writing",
+        "mobile",
+        "web",
+    }:
+        return False
+    if re.search(
+        r"\b(?:future|exposure|project|application|service|team members?|engineers?|intern|users?|profiles?|"
+        r"potential|risks?|expected\s+vs|actual results?|request$|response data|workflows?)\b",
+        lowered,
+    ):
+        return False
+    words = re.findall(r"[a-z0-9+#.-]+", lowered)
+    if len(words) > 4:
+        return False
+    return True
+
+
+def _filter_chunk_skill_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    filtered: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        name = _canonical_chunk_skill_name(item.get("name", ""))
+        if not _valid_chunk_skill_name(name):
+            continue
+        item["name"] = name
+        item["type"] = _skill_type_for_name(name)
+        filtered.append(item)
+    return _clean_skill_rows(filtered)
+
+
+def _skill_type_for_name(name: str) -> str:
+    lowered = name.lower()
+    if re.search(r"\b(testing|reporting|tracking|planning|execution|analysis|design|automation)\b", lowered):
+        return "process"
+    if re.search(r"\b(sql|jira|trello|postman|bruno|selenium|cypress|playwright|excel|power bi|tableau|git)\b", lowered):
+        return "tool"
+    return "technical"
+
+
+def _evidence_snippet(text: str, start: int, end: int, radius: int = 90) -> str:
+    left = max(0, start - radius)
+    right = min(len(text), end + radius)
+    return clean_text(text[left:right])
+
+
+def _snippet_for_skill_name(name: str, text: str) -> str:
+    cleaned_name = clean_text(name)
+    aliases = {
+        "Manual Testing": [r"\bmanual\s+test(?:ing| cases?)\b"],
+        "Test Case Design": [r"\btest\s+case\s+design\b", r"\bdesign(?:ed|ing)?\s+(?:and\s+execut(?:ed|ing)\s+)?(?:manual\s+)?test\s+cases?\b"],
+        "API Testing": [r"\bapi\s+testing\b"],
+    }
+    patterns = aliases.get(cleaned_name, [r"(?<![a-z0-9])" + re.escape(cleaned_name) + r"(?![a-z0-9])"])
+    for raw_pattern in patterns:
+        match = re.search(raw_pattern, text, re.I)
+        if match:
+            return _evidence_snippet(text, match.start(), match.end())
+    return ""
+
+
+def _regex_skill_rows_from_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Generic evidence-first rescue for explicit skill phrases in raw chunks."""
+    rows: List[Dict[str, Any]] = []
+    phrase_patterns = [
+        r"\b(?:manual|automation|api|functional|regression|uat|unit|integration|performance|security|web|mobile)\s+testing\b",
+        r"\btest\s+(?:case\s+design|cases?|planning|execution|data preparation|documentation|results?)\b",
+        r"\b(?:bug|defect)\s+(?:reporting|tracking|reproduction|verification)\b",
+        r"\b(?:business\s+)?requirements?\s+analysis\b",
+        r"\bweb\s+automation\b",
+        r"\b(?:sql|jira|trello|postman|bruno|selenium|cypress|playwright|git|excel|power\s+bi|tableau)\b",
+    ]
+    cue_pattern = re.compile(
+        r"\b(?:using|used|with|tools?|technolog(?:y|ies)|frameworks?|platforms?|familiarity with|knowledge of|experience with|proficiency in)\s*[:\-]?\s+([^.\n;]{2,120})",
+        re.I,
+    )
+
+    for chunk in chunks or []:
+        if not isinstance(chunk, dict):
+            continue
+        text = clean_text(chunk.get("text") or chunk.get("content") or chunk.get("embedding_text") or "")
+        if not text:
+            continue
+        section = normalize_section_label(str(chunk.get("section") or "unknown"))
+        confidence = "high" if section == "skills" else "medium"
+        for pattern in phrase_patterns:
+            for match in re.finditer(pattern, text, re.I):
+                name = _canonical_chunk_skill_name(match.group(0))
+                rows.append({
+                    "name": name,
+                    "type": _skill_type_for_name(name),
+                    "confidence": confidence,
+                    "evidence": _evidence_snippet(text, match.start(), match.end()),
+                })
+        for match in cue_pattern.finditer(text):
+            phrase = re.sub(r"\s+(?:and|or)\s+", ",", match.group(1), flags=re.I)
+            for part in re.split(r"[,/|]", phrase):
+                part = clean_text(part)
+                if not part or len(part) > 40:
+                    continue
+                if re.search(r"\b(?:application|project|service|system|team|engineer|intern|user|data|workflows?)\b", part, re.I):
+                    continue
+                if not re.fullmatch(r"(?:[A-Z][A-Za-z0-9+#.-]{1,}|[A-Z]{2,})(?:\s+[A-Z][A-Za-z0-9+#.-]{1,}){0,2}", part):
+                    continue
+                name = _canonical_chunk_skill_name(part)
+                rows.append({
+                    "name": name,
+                    "type": _skill_type_for_name(name),
+                    "confidence": confidence,
+                    "evidence": _evidence_snippet(text, match.start(), match.end()),
+                })
+    return _filter_chunk_skill_rows(rows)
+
+
+def _llm_skill_rows_from_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    chunk_text = _format_chunks_for_skill_audit(chunks)
+    if not chunk_text:
+        return []
+    raw = _llm_call(CV_CHUNK_SKILL_AUDIT_PROMPT.format(chunk_text=chunk_text))
+    data = _extract_json_object(raw)
+    return _filter_chunk_skill_rows(data.get("skills", []) if isinstance(data, dict) else [])
+
+
+def reconcile_cv_schema_with_chunks(schema: Dict[str, Any], chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Use raw chunks as evidence to verify and fill skill rows missing from CV schema."""
+    schema = _normalize_cv_schema(schema)
+    before_required = len(_as_list(schema.get("required_skills")))
+    before_preferred = len(_as_list(schema.get("preferred_skills")))
+    raw_text = "\n".join(clean_text(ch.get("text") or ch.get("content") or "") for ch in chunks or [] if isinstance(ch, dict))
+    evidence_text = "\n".join(
+        clean_text(ch.get("text") or ch.get("content") or "")
+        for ch in chunks or []
+        if isinstance(ch, dict) and normalize_section_label(str(ch.get("section") or "unknown")) in {"skills", "experience", "projects", "certifications"}
+    ) or raw_text
+
+    verified_required = [
+        row for row in schema.get("required_skills", [])
+        if _skill_evidence_in_text(row.get("name", ""), row.get("evidence", ""), raw_text)
+    ]
+    verified_preferred = [
+        row for row in schema.get("preferred_skills", [])
+        if _skill_evidence_in_text(row.get("name", ""), row.get("evidence", ""), raw_text)
+    ]
+
+    discovered = _merge_skill_rows(_llm_skill_rows_from_chunks(chunks), _regex_skill_rows_from_chunks(chunks))
+    for row in discovered:
+        exact_evidence = _snippet_for_skill_name(row.get("name", ""), evidence_text)
+        if exact_evidence:
+            row["evidence"] = exact_evidence
+    required_additions = [row for row in discovered if row.get("confidence") == "high"]
+    preferred_additions = [row for row in discovered if row.get("confidence") != "high"]
+
+    schema["required_skills"] = _merge_skill_rows(verified_required, required_additions)
+    schema["preferred_skills"] = _merge_skill_rows(verified_preferred, preferred_additions)
+    schema = _normalize_cv_schema(schema)
+    schema["_audit"] = {
+        "skill_reconciliation": {
+            "schema_required_before": before_required,
+            "schema_preferred_before": before_preferred,
+            "schema_required_after": len(_as_list(schema.get("required_skills"))),
+            "schema_preferred_after": len(_as_list(schema.get("preferred_skills"))),
+            "chunk_skill_candidates": len(discovered),
+            "method": "chunk_llm_audit+regex_evidence",
+        }
+    }
+    return schema
+
 
 def get_all_skills(schema: Dict[str, Any]) -> List[Dict[str, Any]]:
     seen: set[str] = set()
