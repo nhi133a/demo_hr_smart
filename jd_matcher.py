@@ -1,346 +1,46 @@
-"""
-jd_matcher.py
-=============
-Match CV chunks với JD chunks bằng global vector search.
-
-Luồng chính:
-  1. Mỗi CV chunk được embed riêng → tìm JD chunks gần nhất trên toàn bộ collection
-  2. Boost score theo section của JD chunk trả về → tổng hợp theo jd_id
-  3. LLM đánh giá chi tiết JD có score cao nhất
-"""
-
-import json
-import logging
 import re
 import unicodedata
-from collections import defaultdict
-from datetime import datetime
+import logging
+import math
+import os
 from difflib import SequenceMatcher
 from typing import Any, Dict, List
 
-from langchain_core.prompts import PromptTemplate
-
 from bedrock_utils import get_embedding
-from jd_store import (
-    count_indexed_jds,
-    get_jd_chunks,
-    search_similar_jds,
-    search_similar_jd_skills,
-)
+from jd_store import _normalize_jd_schema, count_indexed_jds, get_jd_chunks
 
 logger = logging.getLogger(__name__)
 
-LLM_MODEL = "qwen2.5:1.5b"
-
-# Trọng số boost khi tổng hợp similarity score theo section của JD chunk.
-SECTION_WEIGHTS = {
-    "experience":   0.35,
-    "skills":       0.30,
-    "requirements": 0.20,
-    "education":    0.075,
-    "soft_skills":  0.075,
+CROSS_ENCODER_ENABLED = os.getenv("CROSS_ENCODER_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
 }
-DEFAULT_SECTION_WEIGHT = 0.10
-
-
-# =============================================================================
-# TEXT HELPERS
-# =============================================================================
-
-def truncate_text(text: str, max_length: int = 1000) -> str:
-    if len(text) <= max_length:
-        return text
-    truncated = text[:max_length]
-    last_period = truncated.rfind(".")
-    if last_period > max_length * 0.65:
-        return truncated[: last_period + 1] + "..."
-    return truncated + "..."
-
-
-def extract_relevant_sections(cv_chunks: List[Dict]) -> str:
-    """Lấy các CV chunks hữu ích để đưa vào LLM, không phụ thuộc tên section."""
-    sections = []
-
-    for ch in cv_chunks:
-        if ch.get("skip_embed"):
-            continue
-
-        raw_section = str(ch.get("section", "")).strip().lower()
-        label = raw_section.upper() or "CHUNK"
-        skill_text = ch.get("skill_text") or ""
-        content = "\n\n".join(
-            part for part in [ch.get("text", ""), skill_text] if part
-        )
-        content = truncate_text(content, 1100 if "experience" in raw_section else 700)
-        sections.append(f"[{label}]\n{content}")
-
-    # Fallback nếu không nhận ra section nào
-    if not sections and cv_chunks:
-        for i, ch in enumerate(cv_chunks[:5]):
-            sections.append(f"[CHUNK {i + 1}]\n{truncate_text(ch.get('text', ''), 600)}")
-
-    return "\n\n".join(sections)
-
-
-# =============================================================================
-# CV PROFILE
-# =============================================================================
-
-def extract_cv_profile(cv_chunks: List[Dict]) -> Dict[str, Any]:
-    full_text = " ".join(
-        str(ch.get("text") or ch.get("embedding_text") or ch.get("content") or "")
-        for ch in cv_chunks
-    ).lower()
-    found_skills = []
-    for chunk in cv_chunks:
-        info = chunk.get("extracted_info") if isinstance(chunk, dict) else {}
-        if isinstance(info, dict):
-            found_skills.extend(info.get("chunk_skills") or [])
-            found_skills.extend(info.get("technical_skills") or [])
-        skill_text = chunk.get("skill_text") if isinstance(chunk, dict) else ""
-        if skill_text:
-            found_skills.extend(
-                line.strip("- ").strip()
-                for line in str(skill_text).splitlines()
-                if line.strip().startswith("-")
-            )
-    found_skills = list(dict.fromkeys(s for s in found_skills if s))
-    stored_experience = _stored_cv_experience(cv_chunks)
-    if stored_experience:
-        experience_years = float(stored_experience.get("years") or 0)
-        experience_duration = str(stored_experience.get("display") or _format_experience_duration(experience_years))
-    else:
-        experience_years = _calculate_experience_years(full_text)
-        experience_duration = _format_experience_duration(experience_years)
-
-    experience_level  = (
-        "Senior"       if experience_years >= 5 else
-        "Mid-level"    if experience_years >= 2 else
-        "Junior/Intern"
-    )
-
-    return {
-        "skills":          found_skills[:15],
-        "total_skills":    len(found_skills),
-        "experience_years": experience_years,
-        "experience_duration": experience_duration,
-        "experience_level": experience_level,
-    }
-
-
-def build_cv_summary(cv_chunks: List[Dict], cv_profile: Dict) -> str:
-    relevant    = extract_relevant_sections(cv_chunks)
-    profile_str = (
-        f"[CV PRE-PROCESSED SUMMARY]\n"
-        f"Experience Level : {cv_profile['experience_level']} ({cv_profile.get('experience_duration', '0 years')})\n"
-        f"Technical Skills : {cv_profile['total_skills']} skills detected\n"
-        f"Key Skills       : {', '.join(cv_profile['skills']) if cv_profile['skills'] else 'None'}"
-    )
-    return profile_str + "\n\n" + relevant
-
-
-# =============================================================================
-# GLOBAL VECTOR MATCHING
-# =============================================================================
-
-def _search_matching_jd_chunks(embedding: list, k_per_chunk: int) -> List[Dict]:
-    """Search toàn bộ JD collection; section chỉ dùng ở bước boost score."""
-    try:
-        return search_similar_jds(embedding, k=k_per_chunk)
-    except Exception as e:
-        logger.warning("Global JD search failed: %s", e)
-        return []
-
-def _search_matching_jd_skill_chunks(skill_embedding: list, k_per_chunk: int) -> List[Dict]:
-    try:
-        return search_similar_jd_skills(skill_embedding, k=k_per_chunk)
-    except Exception as e:
-        logger.warning("JD skill-layer search failed, falling back to content layer only: %s", e)
-        return []
-
-def _merge_layer_matches(content_matches: List[Dict], skill_matches: List[Dict]) -> List[Dict]:
-    merged: Dict[str, Dict] = {}
-    for layer, matches in (("content", content_matches), ("skills", skill_matches)):
-        for match in matches:
-            key = match.get("chunk_id") or f"{match.get('jd_id')}:{match.get('section')}:{match.get('chunk_index')}"
-            score = float(match.get("score", 0.0))
-            if key not in merged or score > float(merged[key].get("score", 0.0)):
-                row = match.copy()
-                row["matched_layers"] = [layer]
-                merged[key] = row
-            elif layer not in merged[key].setdefault("matched_layers", []):
-                merged[key]["matched_layers"].append(layer)
-    return sorted(merged.values(), key=lambda item: float(item.get("score", 0.0)), reverse=True)
-
-
-def _section_weight(section: str) -> float:
-    return SECTION_WEIGHTS.get(str(section or "").strip().lower(), DEFAULT_SECTION_WEIGHT)
-
-
-def _boost_score(score: float, section: str) -> float:
-    return score * (1.0 + _section_weight(section))
-
-
-def _aggregate_boosted_scores(scores: List[float]) -> float:
-    if not scores:
-        return 0.0
-    best = max(scores)
-    mean = sum(scores) / len(scores)
-    return min(1.0, 0.7 * best + 0.3 * mean)
-
-
-def _match_chunks_to_jds(cv_chunks: List[Dict], k_per_chunk: int = 5) -> Dict[str, Dict]:
-    """
-    Embed từng CV chunk → search toàn bộ JD collection → tổng hợp score theo jd_id.
-
-    Section của CV không còn dùng làm filter cứng. Section của JD chunk trả về
-    chỉ dùng để boost/rank sau khi vector search đã tìm candidate phù hợp.
-
-    Returns:
-        Dict[jd_id] = {
-            "title":          str,
-            "weighted_score": float,   # 0–1, tổng hợp có trọng số
-            "section_scores": Dict[section, float],
-            "matched_chunks": List[Dict],  # JD chunks tìm thấy
-        }
-    """
-    jd_data: Dict[str, Dict] = defaultdict(lambda: {
-        "title":         "",
-        "section_scores": defaultdict(list),
-        "boosted_scores": [],
-        "matched_chunks": [],
-    })
-
-    for cv_chunk in cv_chunks:
-        if cv_chunk.get("skip_embed"):
-            continue
-
-        raw_section = str(cv_chunk.get("section", "")).strip().lower()
-
-        try:
-            stored_embedding = cv_chunk.get("embedding")
-            if isinstance(stored_embedding, list) and stored_embedding:
-                embedding = stored_embedding
-            else:
-                embedding_source = cv_chunk.get("embedding_text") or cv_chunk.get("text") or ""
-                embedding = get_embedding(embedding_source)
-        except Exception as e:
-            logger.warning("Embed thất bại chunk '%s': %s", raw_section, e)
-            continue
-
-        content_matches = _search_matching_jd_chunks(embedding, k_per_chunk)
-        skill_matches: List[Dict] = []
-        skill_text = cv_chunk.get("skill_text") or ""
-        if skill_text.strip():
-            try:
-                skill_embedding = get_embedding(skill_text)
-                skill_matches = _search_matching_jd_skill_chunks(skill_embedding, k_per_chunk)
-            except Exception as e:
-                logger.warning("CV skill embedding failed for chunk '%s': %s", raw_section, e)
-
-        jd_chunks = _merge_layer_matches(content_matches, skill_matches)
-
-        for jd_chunk in jd_chunks:
-            jid   = jd_chunk.get("jd_id", "unknown")
-            score = float(jd_chunk.get("score", 0.0))
-
-            jd_data[jid]["title"] = jd_chunk.get("title", "Untitled")
-            matched_section = jd_chunk.get("section") or "unknown"
-            jd_data[jid]["section_scores"][matched_section].append(score)
-            jd_data[jid]["boosted_scores"].append(_boost_score(score, matched_section))
-            jd_data[jid]["matched_chunks"].append(jd_chunk)
-
-    # Tổng hợp score sau khi boost theo section của JD chunk trả về.
-    results = {}
-    for jid, data in jd_data.items():
-        weighted = _aggregate_boosted_scores(data["boosted_scores"])
-
-        # Gộp content các JD chunks theo jd_id để đưa vào LLM
-        seen_chunks = {}
-        for ch in get_jd_chunks(jid) or data["matched_chunks"]:
-            if ch["jd_id"] == jid:
-                content = ch.get("content", "")
-                skill_text = ch.get("skill_text") or ""
-                seen_chunks[ch.get("section", "")] = "\n\n".join(
-                    part for part in [content, skill_text] if part
-                )
-
-        jd_content = "\n\n".join(
-            f"[{sec.upper()}]\n{txt}" for sec, txt in seen_chunks.items()
-        )
-
-        results[jid] = {
-            "title":          data["title"],
-            "weighted_score": round(weighted, 4),
-            "section_scores": {
-                sec: round(max(scores), 4)
-                for sec, scores in data["section_scores"].items()
-            },
-            "jd_content":     jd_content,
-        }
-
-    return results
-
-
-# =============================================================================
-# LLM EVALUATION
-# =============================================================================
-
-MATCH_PROMPT = PromptTemplate.from_template(
-    """You are a strict and experienced technical recruiter.
-
-=== JOB DESCRIPTION ===
-{jd_content}
-
-=== CANDIDATE CV ===
-{cv_summary}
-
-Evaluate this candidate strictly against the Job Description.
-
-Scoring Criteria:
-- Technical Skills Match (40 points): How many required skills are present?
-- Experience Relevance (30 points): Use the JD requirement. If the JD does not require experience, do not penalize lack of years.
-- Education & Background (20 points): Use the JD requirement. If the JD does not mention a specific degree/background, give a neutral/pass score.
-- Overall Fit & Communication (10 points): never exceed 10.
-
-Rules:
-- Never return a sub-score above its maximum.
-- matched_skills and missing_skills must only contain skills explicitly present in the JD.
-- Do not invent skills that are not in the JD.
-
-Return ONLY a valid JSON object (no extra text, no markdown):
-
-{{
-  "score": <total 0-100>,
-  "technical_score": <0-40>,
-  "experience_score": <0-30>,
-  "education_score": <0-20>,
-  "fit_score": <0-10>,
-  "matched_skills": ["list of matching skills"],
-  "missing_skills": ["important missing skills"],
-  "recommendation": "Strong fit" | "Good fit" | "Consider" | "Not a fit",
-  "summary": "2-3 sentences brief and honest assessment"
-}}
-
-JSON:"""
+CROSS_ENCODER_MODEL = os.getenv("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+CROSS_ENCODER_LOCAL_FILES_ONLY = os.getenv("CROSS_ENCODER_LOCAL_FILES_ONLY", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+CROSS_ENCODER_MAX_CHUNKS = max(1, int(os.getenv("CROSS_ENCODER_MAX_CHUNKS", "6") or 6))
+CROSS_ENCODER_TOP_AVG = max(1, int(os.getenv("CROSS_ENCODER_TOP_AVG", "3") or 3))
+CROSS_ENCODER_MAX_JD_CHARS = max(500, int(os.getenv("CROSS_ENCODER_MAX_JD_CHARS", "3500") or 3500))
+CROSS_ENCODER_MAX_CHUNK_CHARS = max(300, int(os.getenv("CROSS_ENCODER_MAX_CHUNK_CHARS", "1200") or 1200))
+CROSS_ENCODER_WEIGHT = max(0.0, min(1.0, float(os.getenv("CROSS_ENCODER_WEIGHT", "0.25") or 0.25)))
+REQUIREMENT_EVIDENCE_ENABLED = os.getenv("REQUIREMENT_EVIDENCE_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+REQUIREMENT_EVIDENCE_THRESHOLD = max(
+    0.0,
+    min(1.0, float(os.getenv("REQUIREMENT_EVIDENCE_THRESHOLD", "0.55") or 0.55)),
 )
+REQUIREMENT_EVIDENCE_MAX_REQUIREMENTS = max(1, int(os.getenv("REQUIREMENT_EVIDENCE_MAX_REQUIREMENTS", "18") or 18))
+REQUIREMENT_EVIDENCE_MAX_CHUNKS = max(1, int(os.getenv("REQUIREMENT_EVIDENCE_MAX_CHUNKS", "4") or 4))
 
-
-def _evaluate_with_llm(jd_content: str, cv_summary: str, llm_chain) -> Dict:
-    try:
-        raw = llm_chain.invoke({
-            "jd_content": truncate_text(jd_content, 2000),
-            "cv_summary": cv_summary,
-        })
-        return _safe_json_parse(raw)
-    except Exception as e:
-        logger.error("LLM evaluation failed: %s", e)
-        return _empty_evaluation(f"LLM processing error: {str(e)[:120]}")
-
-
-# =============================================================================
-# SCORING GUARDRAILS
-# =============================================================================
+_cross_encoder_model = None
+_cross_encoder_load_attempted = False
 
 SCORE_LIMITS = {
     "technical_score": 40,
@@ -503,6 +203,83 @@ def _token_set(value: str) -> set[str]:
     return set(re.findall(r"[a-z0-9+#]+", _norm_text(value)))
 
 
+SKILL_TEXT_EVIDENCE = {
+    "restapidesign": (
+        r"\brest(?:ful)?\s+apis?\b",
+        r"\brest\s+endpoints?\b",
+        r"\bapi\s+(?:design|development|endpoints?)\b",
+    ),
+    "databasemodeling": (
+        r"\bdatabase\s+(?:model(?:ing|s)?|design|layouts?|schemas?)\b",
+        r"\b(?:relational|non relational)\s+(?:data\s+)?model(?:ing|s)?\b",
+        r"\b(?:entity|table)\s+(?:relationships?|schemas?)\b",
+    ),
+    "serversidelogic": (
+        r"\bserver\s+side\s+(?:logic|components?|services?|development)\b",
+        r"\bbackend\s+(?:logic|components?|services?|development)\b",
+    ),
+    "teamwork": (
+        r"\bteam(?:work| collaboration)\b",
+        r"\bcollaborat(?:e|ed|ing|ion)\b",
+        r"\bworked\s+(?:with|in)\s+(?:a\s+)?team\b",
+    ),
+    "selflearning": (
+        r"\bself\s+(?:learning|study|taught)\b",
+        r"\beager(?:ness)?\s+to\s+learn\b",
+        r"\blearn(?:ed|ing)?\s+new\s+(?:technologies|tools|skills)\b",
+    ),
+    "communication": (
+        r"\bcommunicat(?:e|ed|ing|ion)\b",
+        r"\bclear\s+(?:presentation|reporting|documentation)\b",
+    ),
+    "goodcommunication": (
+        r"\bcommunicat(?:e|ed|ing|ion)\b",
+        r"\bclear\s+(?:presentation|reporting|documentation)\b",
+    ),
+    "manualtesting": (
+        r"\bmanual\s+test(?:ing| cases?)\b",
+    ),
+    "manualtestingprocesses": (
+        r"\bmanual\s+test(?:ing| cases?)\b",
+    ),
+    "functionaltesting": (
+        r"\bfunctional\s+testing\b",
+        r"\bfunctional\b(?:\s+[a-z0-9]+){0,5}\s+testing\b",
+    ),
+    "defectreporting": (
+        r"\b(?:report(?:ed|ing)?|document(?:ed|ation)?|track(?:ed|ing)?)\b(?:\s+[a-z0-9]+){0,6}\s+defects?\b",
+        r"\bdefects?\b(?:\s+[a-z0-9]+){0,6}\s+(?:report(?:ed|ing)?|document(?:ed|ation)?|track(?:ed|ing)?)\b",
+    ),
+    "bugtracking": (
+        r"\b(?:track(?:ed|ing)?|reproduc(?:e|ed|ing))\b(?:\s+[a-z0-9]+){0,6}\s+(?:bugs?|defects?)\b",
+        r"\b(?:bugs?|defects?)\b(?:\s+[a-z0-9]+){0,6}\s+track(?:ed|ing)?\b",
+    ),
+    "proactiveness": (
+        r"\bproactiv(?:e|ely|eness)\b",
+    ),
+    "dataanalysis": (
+        r"\bdata\s+(?:analysis|analytics|processing|preprocessing|visuali[sz]ation)\b",
+        r"\banaly[sz](?:e|ed|ing)\s+data\b",
+        r"\b(?:pandas|numpy)\b",
+    ),
+    "reporting": (
+        r"\breports?\b",
+        r"\breporting\b",
+        r"\bdashboards?\b",
+        r"\b(?:power\s*bi|tableau)\b",
+    ),
+    "dashboards": (
+        r"\bdashboards?\b",
+        r"\bdata\s+visuali[sz]ation\b",
+        r"\b(?:power\s*bi|tableau)\b",
+    ),
+    "datavisualization": (
+        r"\bdata\s+visuali[sz]ation\b",
+        r"\b(?:matplotlib|seaborn|power\s*bi|tableau)\b",
+    ),
+}
+
+
 def _skills_match(jd_skill: str, cv_skill: str) -> bool:
     left_key = _skill_key(jd_skill)
     right_key = _skill_key(cv_skill)
@@ -517,6 +294,39 @@ def _skills_match(jd_skill: str, cv_skill: str) -> bool:
     if left_tokens and right_tokens and left_tokens <= right_tokens:
         return True
     return SequenceMatcher(None, left_key, right_key).ratio() >= 0.90
+
+
+def _snippet_for_pattern(text: str, pattern: str) -> str:
+    """Return a compact raw CV snippet that contains the normalized match."""
+    for snippet in re.split(r"(?:\r?\n)+|(?<=[.!?])\s+", str(text or "")):
+        if re.search(pattern, _norm_text(snippet), re.I):
+            return re.sub(r"\s+", " ", snippet).strip()[:500]
+    return ""
+
+
+def _skill_text_match(jd_skill: str, cv_text: str) -> Dict[str, str] | None:
+    """Find skill evidence in raw CV text when canonical skill names differ."""
+    normalized_cv_text = _norm_text(cv_text)
+    normalized_skill = _norm_text(jd_skill)
+    if not normalized_cv_text or not normalized_skill:
+        return None
+
+    exact_pattern = rf"(?<![a-z0-9]){re.escape(normalized_skill)}(?![a-z0-9])"
+    if re.search(exact_pattern, normalized_cv_text):
+        return {
+            "name": jd_skill,
+            "evidence": _snippet_for_pattern(cv_text, exact_pattern) or jd_skill,
+            "section": "raw_text",
+        }
+
+    for pattern in SKILL_TEXT_EVIDENCE.get(_skill_key(jd_skill), ()):
+        if re.search(pattern, normalized_cv_text, re.I):
+            return {
+                "name": jd_skill,
+                "evidence": _snippet_for_pattern(cv_text, pattern) or jd_skill,
+                "section": "raw_text",
+            }
+    return None
 
 
 def _match_rows(jd_rows: List[Dict], cv_rows: List[Dict], cv_text: str) -> tuple[float, List[str], List[str], Dict[str, Dict]]:
@@ -535,8 +345,8 @@ def _match_rows(jd_rows: List[Dict], cv_rows: List[Dict], cv_text: str) -> tuple
             continue
         total_weight += _row_weight(jd_row)
         match_row = next((row for row in cv_rows if _skills_match(name, _row_name(row))), None)
-        if not match_row and _skill_key(name) and re.search(rf"(?<![a-z0-9]){re.escape(_norm_text(name))}(?![a-z0-9])", _norm_text(cv_text)):
-            match_row = {"name": name, "evidence": name}
+        if not match_row:
+            match_row = _skill_text_match(name, cv_text)
 
         if match_row:
             matched.append(name)
@@ -751,6 +561,475 @@ def _retrieval_evidence(hits: List[Dict], limit: int = 5) -> List[Dict]:
     return evidence
 
 
+def _get_cross_encoder_model():
+    global _cross_encoder_model, _cross_encoder_load_attempted
+    if not CROSS_ENCODER_ENABLED:
+        return None
+    if _cross_encoder_model is not None:
+        return _cross_encoder_model
+    if _cross_encoder_load_attempted:
+        return None
+
+    _cross_encoder_load_attempted = True
+    try:
+        from sentence_transformers import CrossEncoder
+
+        _cross_encoder_model = CrossEncoder(
+            CROSS_ENCODER_MODEL,
+            local_files_only=CROSS_ENCODER_LOCAL_FILES_ONLY,
+        )
+        return _cross_encoder_model
+    except Exception as exc:
+        logger.warning("Cross-encoder unavailable; continuing without it: %s", exc)
+        return None
+
+
+def _truncate_for_cross_encoder(text: str, limit: int) -> str:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(text) <= limit:
+        return text
+    truncated = text[:limit]
+    sentence_end = max(truncated.rfind(". "), truncated.rfind("; "), truncated.rfind("\n"))
+    if sentence_end >= int(limit * 0.65):
+        return truncated[: sentence_end + 1].strip()
+    return truncated.strip()
+
+
+def _cross_encoder_probability(raw_score: Any) -> float:
+    try:
+        score = float(raw_score)
+    except Exception:
+        return 0.0
+    if 0.0 <= score <= 1.0:
+        return score
+    return 1.0 / (1.0 + math.exp(-max(-50.0, min(50.0, score))))
+
+
+def _cross_encoder_chunk_text(chunk: Dict) -> str:
+    return str(
+        chunk.get("content")
+        or chunk.get("text")
+        or chunk.get("original_text")
+        or chunk.get("embedding_text")
+        or ""
+    )
+
+
+def _candidate_cross_encoder_chunks(cv_chunks: List[Dict], retrieval_hits: List[Dict] | None = None) -> List[Dict]:
+    candidates: List[Dict] = []
+    candidates.extend(hit for hit in (retrieval_hits or []) if isinstance(hit, dict))
+    candidates.extend(chunk for chunk in (cv_chunks or []) if isinstance(chunk, dict))
+
+    selected = []
+    seen = set()
+    for chunk in candidates:
+        text = _cross_encoder_chunk_text(chunk)
+        clean = re.sub(r"\s+", " ", text).strip()
+        if len(clean) < 20:
+            continue
+        key = clean[:500].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(
+            {
+                "section": chunk.get("section", "unknown"),
+                "text": clean,
+                "retrieval_score": float(chunk.get("score", 0.0) or 0.0),
+            }
+        )
+        if len(selected) >= CROSS_ENCODER_MAX_CHUNKS:
+            break
+    return selected
+
+
+def _cross_encoder_score(
+    jd_content: str,
+    cv_chunks: List[Dict],
+    *,
+    retrieval_hits: List[Dict] | None = None,
+) -> tuple[float, List[Dict]]:
+    model = _get_cross_encoder_model()
+    if model is None:
+        return 0.0, []
+
+    jd_text = _truncate_for_cross_encoder(jd_content, CROSS_ENCODER_MAX_JD_CHARS)
+    chunks = _candidate_cross_encoder_chunks(cv_chunks, retrieval_hits)
+    if not jd_text or not chunks:
+        return 0.0, []
+
+    pairs = [
+        [jd_text, _truncate_for_cross_encoder(chunk["text"], CROSS_ENCODER_MAX_CHUNK_CHARS)]
+        for chunk in chunks
+    ]
+    try:
+        predictions = model.predict(pairs, show_progress_bar=False)
+    except TypeError:
+        predictions = model.predict(pairs)
+    except Exception as exc:
+        logger.warning("Cross-encoder scoring failed: %s", exc)
+        return 0.0, []
+
+    scored = []
+    for chunk, raw_score in zip(chunks, list(predictions)):
+        probability = _cross_encoder_probability(raw_score)
+        scored.append({**chunk, "score": probability})
+    scored.sort(key=lambda item: item["score"], reverse=True)
+
+    top = scored[:CROSS_ENCODER_TOP_AVG]
+    score = round(100 * sum(item["score"] for item in top) / max(1, len(top)), 1)
+    evidence = [
+        {
+            "jd_requirement_type": "cross_encoder",
+            "jd_section": "CROSS_ENCODER",
+            "cv_section": item.get("section", "unknown"),
+            "cv_text": item["text"][:500],
+            "score": round(item["score"], 4),
+        }
+        for item in scored[:3]
+    ]
+    return score, evidence
+
+
+def _requirement_units(jd_schema: Dict) -> List[Dict]:
+    def is_label(value: str) -> bool:
+        return bool(re.match(r"^\s*(?:job\s+title|title|position|role)\s*:", str(value or ""), re.I))
+
+    schema_units = jd_schema.get("requirement_units") if isinstance(jd_schema, dict) else []
+    units: List[Dict] = []
+    seen = set()
+    for unit in schema_units if isinstance(schema_units, list) else []:
+        if not isinstance(unit, dict):
+            continue
+        name = str(unit.get("name") or "").strip()
+        evidence = str(unit.get("evidence") or "")
+        category = str(unit.get("category") or "skill").strip().lower()
+        importance = str(unit.get("importance") or "required").strip().lower()
+        if category in {"skill", "certification"}:
+            source = "preferred_skill" if importance == "preferred" else "required_skill"
+        elif category == "soft_skill":
+            source = "soft_skill"
+        elif category == "responsibility":
+            source = "responsibility"
+        else:
+            continue
+        dedupe_key = (source, _skill_key(name), _skill_key(evidence))
+        if not name or is_label(name) or is_label(evidence) or dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        units.append(
+            {
+                "name": name,
+                "source": source,
+                "importance": importance or source,
+                "evidence": evidence,
+                "row": unit,
+            }
+        )
+        if len(units) >= REQUIREMENT_EVIDENCE_MAX_REQUIREMENTS:
+            return units
+    if units:
+        return units
+
+    specs = [
+        ("required_skills", "required_skill", "required"),
+        ("preferred_skills", "preferred_skill", "preferred"),
+        ("competencies", "competency", "competency"),
+        ("soft_skills", "soft_skill", "competency"),
+    ]
+    units = []
+    seen = set()
+    for key, source, importance in specs:
+        for row in _rows(jd_schema, key):
+            name = _row_name(row)
+            dedupe_key = (source, _skill_key(name))
+            evidence = str(row.get("evidence") or "")
+            if not name or is_label(name) or is_label(evidence) or dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            units.append(
+                {
+                    "name": name,
+                    "source": source,
+                    "importance": str(row.get("importance") or importance),
+                    "evidence": str(row.get("evidence") or ""),
+                    "row": row,
+                }
+            )
+            if len(units) >= REQUIREMENT_EVIDENCE_MAX_REQUIREMENTS:
+                return units
+    return units
+
+
+def _requirement_prompt(unit: Dict, jd_schema: Dict) -> str:
+    role = ""
+    context = jd_schema.get("work_context") if isinstance(jd_schema, dict) else {}
+    if isinstance(context, dict):
+        role = str(context.get("role") or "")
+    title = str(jd_schema.get("job_title") or role or "").strip()
+    parts = [
+        f"Requirement: {unit.get('name', '')}",
+        f"Type: {unit.get('source', '')}",
+    ]
+    if title:
+        parts.append(f"Role: {title}")
+    if unit.get("evidence"):
+        parts.append(f"JD evidence: {unit['evidence']}")
+    return "\n".join(parts)
+
+
+def _chunk_candidate_score(unit: Dict, chunk: Dict, cv_rows: List[Dict]) -> float:
+    text = _cross_encoder_chunk_text(chunk)
+    name = str(unit.get("name") or "")
+    if not text or not name:
+        return 0.0
+    score = 0.0
+    if _skill_text_match(name, text):
+        score += 4.0
+    req_tokens = _token_set(name)
+    text_tokens = _token_set(text)
+    if req_tokens and text_tokens:
+        score += len(req_tokens & text_tokens) / max(1, len(req_tokens))
+    for row in cv_rows:
+        row_name = _row_name(row)
+        evidence = str(row.get("evidence") or "")
+        if _skills_match(name, row_name):
+            score += 3.0
+            if evidence and evidence.lower() in text.lower():
+                score += 2.0
+    return score
+
+
+def _candidate_requirement_chunks(unit: Dict, cv_chunks: List[Dict], cv_rows: List[Dict]) -> List[Dict]:
+    candidates = []
+    for chunk in cv_chunks or []:
+        if not isinstance(chunk, dict):
+            continue
+        text = _cross_encoder_chunk_text(chunk)
+        clean = re.sub(r"\s+", " ", text).strip()
+        if len(clean) < 20:
+            continue
+        candidates.append(
+            {
+                "section": chunk.get("section", "unknown"),
+                "text": clean,
+                "candidate_score": _chunk_candidate_score(unit, chunk, cv_rows),
+            }
+        )
+    candidates.sort(key=lambda item: (item["candidate_score"], len(item["text"])), reverse=True)
+    return candidates[:REQUIREMENT_EVIDENCE_MAX_CHUNKS]
+
+
+def _requirement_evidence_matches(
+    jd_schema: Dict,
+    cv_chunks: List[Dict],
+) -> tuple[List[Dict], List[Dict]]:
+    if not REQUIREMENT_EVIDENCE_ENABLED:
+        return [], []
+    model = _get_cross_encoder_model()
+    if model is None:
+        return [], []
+
+    cv_schema = _first_schema(cv_chunks, "cv_schema")
+    cv_rows = _cv_skill_rows(cv_chunks, cv_schema)
+    cv_text = _cv_text(cv_chunks)
+    units = _requirement_units(jd_schema)
+    if not units:
+        return [], []
+
+    best_by_requirement: Dict[tuple[str, str], Dict] = {}
+    for unit in units:
+        name = str(unit.get("name") or "")
+        match_row = next((row for row in cv_rows if _skills_match(name, _row_name(row))), None)
+        if not match_row:
+            match_row = _skill_text_match(name, cv_text)
+        if match_row:
+            key = (str(unit.get("source") or ""), _skill_key(name))
+            best_by_requirement[key] = {
+                "requirement": name,
+                "source": unit.get("source", ""),
+                "importance": unit.get("importance", ""),
+                "status": "matched",
+                "confidence": 0.95,
+                "evidence": str(match_row.get("evidence") or match_row.get("source") or name)[:500],
+                "cv_section": str(match_row.get("section") or "schema"),
+                "method": "schema_or_raw_evidence",
+            }
+
+    work_items = []
+    pairs = []
+    for unit in units:
+        requirement_text = _truncate_for_cross_encoder(_requirement_prompt(unit, jd_schema), 700)
+        for chunk in _candidate_requirement_chunks(unit, cv_chunks, cv_rows):
+            work_items.append((unit, chunk))
+            pairs.append([requirement_text, _truncate_for_cross_encoder(chunk["text"], CROSS_ENCODER_MAX_CHUNK_CHARS)])
+
+    if not pairs:
+        return [], []
+
+    try:
+        predictions = model.predict(pairs, show_progress_bar=False)
+    except TypeError:
+        predictions = model.predict(pairs)
+    except Exception as exc:
+        logger.warning("Requirement evidence scoring failed: %s", exc)
+        return [], []
+
+    for (unit, chunk), raw_score in zip(work_items, list(predictions)):
+        confidence = _cross_encoder_probability(raw_score)
+        key = (str(unit.get("source") or ""), _skill_key(str(unit.get("name") or "")))
+        current = best_by_requirement.get(key)
+        if not current or confidence > current["confidence"]:
+            best_by_requirement[key] = {
+                "requirement": unit.get("name", ""),
+                "source": unit.get("source", ""),
+                "importance": unit.get("importance", ""),
+                "status": "matched" if confidence >= REQUIREMENT_EVIDENCE_THRESHOLD else "missing",
+                "confidence": round(confidence, 4),
+                "evidence": chunk["text"][:500] if confidence >= REQUIREMENT_EVIDENCE_THRESHOLD else "",
+                "cv_section": chunk.get("section", "unknown"),
+                "method": "cross_encoder_requirement_evidence",
+            }
+
+    details = []
+    for unit in units:
+        key = (str(unit.get("source") or ""), _skill_key(str(unit.get("name") or "")))
+        details.append(
+            best_by_requirement.get(
+                key,
+                {
+                    "requirement": unit.get("name", ""),
+                    "source": unit.get("source", ""),
+                    "importance": unit.get("importance", ""),
+                    "status": "missing",
+                    "confidence": 0.0,
+                    "evidence": "",
+                    "cv_section": "",
+                    "method": "cross_encoder_requirement_evidence",
+                },
+            )
+        )
+
+    evidence = [
+        {
+            "skill": item["requirement"],
+            "jd_requirement_type": item["source"],
+            "jd_section": "REQUIREMENT_EVIDENCE",
+            "cv_section": item.get("cv_section", "unknown"),
+            "cv_text": item.get("evidence", ""),
+            "score": item.get("confidence", 0.0),
+        }
+        for item in details
+        if item.get("status") == "matched" and item.get("evidence")
+    ][:8]
+    return details, evidence
+
+
+def _ratio_from_requirement_details(details: List[Dict], *sources: str) -> tuple[float, List[str], List[str]]:
+    selected = [item for item in details if item.get("source") in sources]
+    if not selected:
+        return 1.0, [], []
+    matched = [str(item.get("requirement") or "") for item in selected if item.get("status") == "matched"]
+    missing = [str(item.get("requirement") or "") for item in selected if item.get("status") != "matched"]
+    return len(matched) / max(1, len(selected)), _dedupe_keep_order(matched), _dedupe_keep_order(missing)
+
+
+def _apply_requirement_evidence_refinement(
+    jd_schema: Dict,
+    cv_chunks: List[Dict],
+    evaluation: Dict,
+    section_scores: Dict,
+    evidence: List[Dict],
+) -> tuple[float, Dict, Dict, List[Dict]]:
+    details, requirement_evidence = _requirement_evidence_matches(jd_schema, cv_chunks)
+    if not details:
+        return float(evaluation.get("score", 0)), evaluation, section_scores, evidence
+
+    required_ratio, matched_required, missing_required = _ratio_from_requirement_details(details, "required_skill")
+    preferred_ratio, matched_preferred, missing_preferred = _ratio_from_requirement_details(details, "preferred_skill")
+    competency_ratio, matched_comp, missing_comp = _ratio_from_requirement_details(details, "competency", "soft_skill")
+
+    weights = section_scores.get("weights") if isinstance(section_scores.get("weights"), dict) else _normalize_weights(jd_schema)
+    old_required = section_scores.get("required_skills", 100) / 100
+    old_preferred = section_scores.get("preferred_skills", 100) / 100
+    old_competency = section_scores.get("competencies", 100) / 100
+
+    if matched_required or missing_required:
+        section_scores["required_skills"] = round(100 * required_ratio)
+    else:
+        required_ratio = old_required
+    if matched_preferred or missing_preferred:
+        section_scores["preferred_skills"] = round(100 * preferred_ratio)
+    else:
+        preferred_ratio = old_preferred
+    if matched_comp or missing_comp:
+        section_scores["competencies"] = round(100 * competency_ratio)
+    else:
+        competency_ratio = old_competency
+
+    skill_weight = weights.get("required_skills", 0) + weights.get("preferred_skills", 0) + weights.get("competencies", 0)
+    skill_ratio = (
+        weights.get("required_skills", 0) * required_ratio
+        + weights.get("preferred_skills", 0) * preferred_ratio
+        + weights.get("competencies", 0) * competency_ratio
+    ) / max(skill_weight, 0.01)
+    quality_ratio = section_scores.get("quality", 0) / 100
+    context_ratio = section_scores.get("context", 0) / 100
+    fit_ratio = (quality_ratio + context_ratio) / 2
+
+    evaluation = evaluation.copy()
+    has_required_details = any(item.get("source") == "required_skill" for item in details)
+    has_preferred_details = any(item.get("source") == "preferred_skill" for item in details)
+    has_competency_details = any(item.get("source") in {"competency", "soft_skill"} for item in details)
+    evaluation["matched_required_skills"] = matched_required if has_required_details else evaluation.get("matched_required_skills", [])
+    evaluation["missing_required_skills"] = missing_required if has_required_details else evaluation.get("missing_required_skills", [])
+    evaluation["matched_preferred_skills"] = matched_preferred if has_preferred_details else evaluation.get("matched_preferred_skills", [])
+    evaluation["missing_preferred_skills"] = missing_preferred if has_preferred_details else evaluation.get("missing_preferred_skills", [])
+    evaluation["matched_competencies"] = matched_comp if has_competency_details else evaluation.get("matched_competencies", [])
+    evaluation["missing_competencies"] = missing_comp if has_competency_details else evaluation.get("missing_competencies", [])
+    evaluation["matched_skills"] = _dedupe_keep_order(
+        evaluation.get("matched_required_skills", [])
+        + evaluation.get("matched_preferred_skills", [])
+        + evaluation.get("matched_competencies", [])
+    )
+    evaluation["missing_skills"] = _dedupe_keep_order(
+        evaluation.get("missing_required_skills", [])
+        + evaluation.get("missing_preferred_skills", [])
+        + evaluation.get("missing_competencies", [])
+    )
+    evaluation["requirement_match_details"] = details
+    evaluation["technical_score"] = round(40 * skill_ratio)
+    evaluation["fit_score"] = round(10 * fit_ratio)
+    evaluation["score"] = sum(evaluation[key] for key in SCORE_LIMITS)
+    evaluation["recommendation"] = _recommendation(evaluation["score"])
+    cv_schema = _first_schema(cv_chunks, "cv_schema")
+    cv_months = int((cv_schema or {}).get("experience_months") or 0)
+    required_months = int(((jd_schema or {}).get("experience") or {}).get("min_months") or 0)
+    evaluation["summary"] = _summary(
+        evaluation["score"],
+        evaluation.get("matched_required_skills", []),
+        evaluation.get("missing_required_skills", []),
+        cv_months,
+        required_months,
+    )
+    return float(evaluation["score"]), evaluation, section_scores, (requirement_evidence + evidence)[:8]
+
+
+def _combine_rerank_score(schema_score: float, retrieval_score: float, cross_encoder_score: float) -> tuple[float, str]:
+    retrieval_pct = max(0.0, min(100.0, retrieval_score * 100))
+    if cross_encoder_score > 0:
+        remaining = max(0.0, 1.0 - CROSS_ENCODER_WEIGHT)
+        schema_weight = remaining * 0.80
+        retrieval_weight = remaining * 0.20
+        score = (
+            schema_score * schema_weight
+            + cross_encoder_score * CROSS_ENCODER_WEIGHT
+            + retrieval_pct * retrieval_weight
+        )
+        return round(score, 1), "schema_score+cross_encoder+rag"
+    return round((schema_score * 0.85) + (retrieval_pct * 0.15), 1), "schema_score+rag_tiebreak"
+
+
 def _retrieve_candidate_sources(
     jd_schema: Dict,
     jd_content: str,
@@ -915,7 +1194,7 @@ def _deterministic_evaluation(
     matched = []
     missing = []
     for skill in jd_required:
-        if any(_skills_match(skill, cv_skill) for cv_skill in cv_skills) or _skills_match(skill, cv_text):
+        if any(_skills_match(skill, cv_skill) for cv_skill in cv_skills) or _skill_text_match(skill, cv_text):
             matched.append(skill)
         else:
             missing.append(skill)
@@ -1009,7 +1288,9 @@ def _jd_content_and_schema(jd_chunks: List[Dict]) -> tuple[str, Dict]:
         content = str(chunk.get("content") or chunk.get("embedding_text") or "")
         if content:
             parts.append(f"[{section}]\n{content}")
-    return "\n\n".join(parts), _first_schema(jd_chunks, "jd_schema")
+    content = "\n\n".join(parts)
+    schema = _first_schema(jd_chunks, "jd_schema")
+    return content, _normalize_jd_schema(schema, fallback_text=content) if schema else {}
 
 
 def match_jd_to_cvs(
@@ -1067,21 +1348,28 @@ def match_jd_to_cvs(
         if not cv_chunks:
             continue
         score, evaluation, section_scores, evidence, cv_profile = _score_candidate(jd_schema, jd_content, cv_chunks)
+        score, evaluation, section_scores, evidence = _apply_requirement_evidence_refinement(
+            jd_schema,
+            cv_chunks,
+            evaluation,
+            section_scores,
+            evidence,
+        )
         ok, reasons = _passes_hard_filters(jd_schema, evaluation, cv_profile)
 
         retrieval_score = float(retrieval_scores.get(source, 0.0))
-        rerank_score = round((score * 0.85) + (retrieval_score * 100 * 0.15), 1)
+        cross_score, cross_evidence = _cross_encoder_score(
+            jd_content,
+            cv_chunks,
+            retrieval_hits=retrieval_hits.get(source, []),
+        )
+        rerank_score, rerank_method = _combine_rerank_score(score, retrieval_score, cross_score)
         if not ok:
             rejected[source] = reasons
             evaluation = evaluation.copy()
             evaluation["recommendation"] = "Not a fit"
             evaluation["summary"] = f"{evaluation.get('summary', '')} Filter flags: {'; '.join(reasons)}".strip()
             rerank_score = min(rerank_score, 44.0)
-        jd_data = {
-            "title": jd_title,
-            "weighted_score": score / 100,
-            "section_scores": section_scores,
-        }
         results.append({
             "cv_source": source,
             "candidate_name": _candidate_name(source, cv_chunks, get_candidate_name),
@@ -1090,190 +1378,18 @@ def match_jd_to_cvs(
             "similarity_score": round(score, 1),
             "dense_score": round(retrieval_score * 100, 1),
             "bm25_score": round(section_scores.get("required_skills", 0), 1),
-            "cross_encoder_score": 0,
+            "cross_encoder_score": cross_score,
             "rerank_score": rerank_score,
-            "rerank_method": "schema_score+rag_tiebreak",
+            "rerank_method": rerank_method,
             "retrieval_method": retrieval_method,
-            "section_scores":   jd_data["section_scores"],   # thêm mới: score từng section
-            "evaluation":       evaluation,
-            "cv_profile":       cv_profile,
+            "section_scores": section_scores,
+            "evaluation": evaluation,
+            "cv_profile": cv_profile,
+            "match_evidence": (evidence + cross_evidence + _retrieval_evidence(retrieval_hits.get(source, [])))[:8],
         })
 
-    # Bước 5: sort theo LLM score
+    if not results:
+        return _error_result(jd_id, jd_title, "No candidate CV chunks found")
+
     results.sort(key=lambda item: (item.get("rerank_score", 0), item["evaluation"].get("score", 0)), reverse=True)
     return results[:target_k]
-
-
-# =============================================================================
-# DATE / EXPERIENCE HELPERS (giữ nguyên)
-# =============================================================================
-
-def _stored_cv_experience(cv_chunks: List[Dict]) -> Dict[str, Any] | None:
-    for chunk in cv_chunks:
-        if not isinstance(chunk, dict):
-            continue
-        cv_experience = chunk.get("cv_experience")
-        if isinstance(cv_experience, dict):
-            return cv_experience
-    return None
-
-
-def _years_from_months(months: int) -> float:
-    if months <= 0:
-        return 0
-    if months < 12:
-        return round(months / 12, 2)
-    return float(round(months / 12))
-
-
-def _format_experience_duration(years: float) -> str:
-    if years <= 0:
-        return "0 years"
-    months = round(years * 12)
-    if months < 12:
-        return f"{months} month" + ("" if months == 1 else "s")
-    rounded_years = round(years)
-    return f"{rounded_years} year" + ("" if rounded_years == 1 else "s")
-
-
-def _calculate_experience_years(text: str) -> int:
-    intervals = _extract_date_intervals(text)
-    if intervals:
-        total_months = _merge_and_sum_intervals(intervals)
-        if total_months > 0:
-            return min(max(round(total_months / 12), 0), 60)
-
-    for pattern in [r"(\d+)\s*\+\s*years", r"(\d+)\s*years", r"over\s*(\d+)\s*years"]:
-        m = re.search(pattern, text)
-        if m:
-            return int(m.group(1))
-    return 0
-
-
-def _extract_date_intervals(text: str) -> List[tuple[int, int]]:
-    current       = datetime.now()
-    current_index = _month_index(current.year, current.month)
-    intervals: List[tuple[int, int]] = []
-
-    month_names = (
-        r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
-        r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
-        r"nov(?:ember)?|dec(?:ember)?"
-    )
-    separator  = r"(?:-|–|—|to|until|through)"
-    end_token  = rf"(?:(?:{month_names})\s+\d{{4}}|\d{{1,2}}/\d{{4}}|\d{{4}}|present|current|now|ongoing)"
-    patterns   = [
-        rf"(?P<start_month>{month_names})\s+(?P<start_year>\d{{4}})\s*{separator}\s*(?P<end>{end_token})",
-        rf"(?P<start_month_num>\d{{1,2}})/(?P<start_year_num>\d{{4}})\s*{separator}\s*(?P<end>{end_token})",
-        rf"(?P<start_year_only>\d{{4}})\s*{separator}\s*(?P<end>{end_token})",
-    ]
-
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, re.IGNORECASE):
-            start_index = _parse_start_date(match)
-            end_index   = _parse_end_date(match.group("end"), current_index)
-            if start_index is None or end_index is None:
-                continue
-            if end_index < start_index:
-                continue
-            intervals.append((start_index, end_index))
-
-    return intervals
-
-
-def _parse_start_date(match: re.Match) -> int | None:
-    g = match.groupdict()
-    if g.get("start_month") and g.get("start_year"):
-        return _month_index(int(match.group("start_year")), _month_name_to_number(match.group("start_month")))
-    if g.get("start_month_num") and g.get("start_year_num"):
-        month, year = int(match.group("start_month_num")), int(match.group("start_year_num"))
-        return _month_index(year, month) if 1 <= month <= 12 else None
-    if g.get("start_year_only"):
-        return _month_index(int(match.group("start_year_only")), 1)
-    return None
-
-
-def _parse_end_date(value: str, current_index: int) -> int | None:
-    value = value.strip().lower()
-    if value in {"present", "current", "now", "ongoing"}:
-        return current_index
-
-    m = re.fullmatch(
-        r"(?P<month>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
-        r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
-        r"\s+(?P<year>\d{4})", value, re.IGNORECASE,
-    )
-    if m:
-        return _month_index(int(m.group("year")), _month_name_to_number(m.group("month")))
-
-    m = re.fullmatch(r"(?P<month>\d{1,2})/(?P<year>\d{4})", value)
-    if m:
-        month, year = int(m.group("month")), int(m.group("year"))
-        return _month_index(year, month) if 1 <= month <= 12 else None
-
-    if re.fullmatch(r"\d{4}", value):
-        return _month_index(int(value), 12)
-
-    return None
-
-
-def _month_name_to_number(value: str) -> int:
-    months = {
-        "jan": 1, "january": 1, "feb": 2, "february": 2,
-        "mar": 3, "march": 3, "apr": 4, "april": 4, "may": 5,
-        "jun": 6, "june": 6, "jul": 7, "july": 7,
-        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
-        "oct": 10, "october": 10, "nov": 11, "november": 11,
-        "dec": 12, "december": 12,
-    }
-    return months[value.strip().lower()]
-
-
-def _month_index(year: int, month: int) -> int:
-    return year * 12 + month
-
-
-def _merge_and_sum_intervals(intervals: List[tuple[int, int]]) -> int:
-    if not intervals:
-        return 0
-    intervals = sorted(intervals)
-    merged    = [list(intervals[0])]
-    for start, end in intervals[1:]:
-        last = merged[-1]
-        if start <= last[1] + 1:
-            last[1] = max(last[1], end)
-        else:
-            merged.append([start, end])
-    return sum(end - start + 1 for start, end in merged)
-
-
-# =============================================================================
-# JSON HELPERS
-# =============================================================================
-
-def _safe_json_parse(raw: str) -> Dict:
-    try:
-        return json.loads(raw.strip())
-    except json.JSONDecodeError:
-        m = re.search(r"\{[\s\S]*?\}", raw)
-        if m:
-            try:
-                return json.loads(m.group())
-            except Exception:
-                pass
-        logger.warning("JSON parse failed, returning empty evaluation")
-        return _empty_evaluation("Failed to parse LLM output")
-
-
-def _empty_evaluation(summary: str = "Error") -> Dict:
-    return {
-        "score":            0,
-        "technical_score":  0,
-        "experience_score": 0,
-        "education_score":  0,
-        "fit_score":        0,
-        "matched_skills":   [],
-        "missing_skills":   [],
-        "recommendation":   "Error",
-        "summary":          summary,
-    }

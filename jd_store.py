@@ -20,10 +20,12 @@ JD_COLLECTION_NAME = "job_descriptions"
 VECTOR_INDEX_NAME = "jd_vector_index"
 JD_DB_NAME = "aws_rag_db"
 
-CANONICAL_SECTIONS = {"requirements", "skills", "experience", "education", "soft_skills", "benefits"}
+CANONICAL_SECTIONS = {"requirements", "responsibilities", "preferred_skills", "skills", "experience", "education", "soft_skills", "benefits"}
 
 JD_SECTION_ALIASES = {
-    **dict.fromkeys(["requirements", "requirement", "responsibilities", "responsibility", "job description", "description", "summary", "objective", "yeu cau", "mo ta cong viec", "trach nhiem"], "requirements"),
+    **dict.fromkeys(["requirements", "requirement", "required", "required skills", "must", "must have", "must-have", "job description", "description", "summary", "objective", "yeu cau", "mo ta cong viec"], "requirements"),
+    **dict.fromkeys(["responsibilities", "responsibility", "trach nhiem"], "responsibilities"),
+    **dict.fromkeys(["preferred", "preferred skills", "nice", "nice to have", "nice-to-have", "bonus", "plus", "uu tien"], "preferred_skills"),
     **dict.fromkeys(["skills", "skill", "technical skills", "technologies", "tools", "ky nang", "ki nang", "cong nghe", "cong cu"], "skills"),
     **dict.fromkeys(["experience", "work experience", "qualification", "qualifications", "kinh nghiem", "kinh nghiem lam viec"], "experience"),
     **dict.fromkeys(["education", "degree", "hoc van", "bang cap"], "education"),
@@ -38,12 +40,6 @@ SAMPLE_JDS = [
     {"id": "jd_004", "title": "Data Analyst Intern", "sections": {"requirements": "Analyze data, build reports and dashboards.", "experience": "Data analysis project is preferred; professional experience is not required.", "skills": "Excel, SQL, Python with Pandas and Matplotlib, Power BI or Tableau.", "soft_skills": "Logical thinking, accuracy, clear result presentation."}},
 ]
 
-# DEPRECATED: JD_SCHEMA_PROMPT is replaced by get_jd_parser_prompt() from jd_parser_prompt.py
-# That function provides:
-# - System prompt with clear rules (required vs preferred skills, confidence levels)
-# - Few-shot examples (3 cases: short JD, long prose, mixed Viet-Anh)
-# - Automatic handling of all input formats
-# See jd_parser_prompt.py for full prompt structure
 
 _client = None
 
@@ -68,6 +64,13 @@ def count_indexed_jds() -> int:
 
 def _clean_text(value) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _strip_row_metadata(value: str) -> str:
+    text = _clean_text(value)
+    text = re.sub(r"\s*\([^)]*(?:type|confidence|evidence|importance)\s*=.*$", "", text, flags=re.I)
+    text = re.sub(r"\s+(?:type|confidence|evidence|importance)\s*=.*$", "", text, flags=re.I)
+    return text.strip(" -.;:")
 
 
 def _as_list(value) -> List:
@@ -108,6 +111,8 @@ def _split_jd_text_by_headers(text: str) -> Dict[str, str]:
 
         inline_match = re.match(r"^([^:]{2,60})\s*:\s*(.+)$", line, re.UNICODE)
         if inline_match:
+            if _is_job_title_line(line):
+                continue
             candidate = _normalize_jd_section(inline_match.group(1))
             if candidate in CANONICAL_SECTIONS:
                 current = candidate
@@ -153,6 +158,28 @@ def _dedupe_skills(skills: List[str]) -> List[str]:
     return result
 
 
+def _line_in_text(line: str, text: str) -> bool:
+    return _clean_text(line).lower() in _clean_text(text).lower()
+
+
+def _is_job_title_line(value: str) -> bool:
+    return bool(re.match(r"^\s*(?:job\s+title|title|position|role)\s*:", str(value or ""), re.I))
+
+
+def _split_requirement_lines(section_text: str) -> List[str]:
+    lines: List[str] = []
+    for raw in str(section_text or "").splitlines():
+        line = _clean_text(re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", raw))
+        if not line or _is_job_title_line(line):
+            continue
+        if len(line) <= 140 and "," in line and not re.search(r";|\.\s+\w", line):
+            parts = [part.strip(" .") for part in re.split(r",", line) if part.strip(" .")]
+            lines.extend(parts if len(parts) > 1 else [line])
+        else:
+            lines.append(line)
+    return lines
+
+
 def _extract_json_object(raw: str) -> Dict:
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", str(raw or "").strip(), flags=re.IGNORECASE)
     match = re.search(r"\{.*\}", text, re.DOTALL)
@@ -176,7 +203,7 @@ def _clean_item_rows(value, allowed_keys: List[str], limit: int = 60) -> List[Di
             item = {"name": item}
         if not isinstance(item, dict):
             continue
-        name = _clean_text(item.get("name"))
+        name = _strip_row_metadata(item.get("name"))
         key = _skill_key(name)
         if not key or key in seen:
             continue
@@ -205,6 +232,394 @@ def _clean_expectations(value) -> List[str]:
         if text:
             expectations.append(text)
     return list(dict.fromkeys(expectations))[:30]
+
+
+def _skill_row(name: str, evidence: str, *, confidence: str = "medium", skill_type: str = "") -> Dict:
+    row = {"name": _strip_row_metadata(name), "confidence": confidence, "evidence": _clean_text(evidence)}
+    if skill_type:
+        row["type"] = skill_type
+    return row
+
+
+def _canonical_skill_name(value: str) -> str:
+    text = _strip_row_metadata(value)
+    normalized = _strip_accents(text).lower()
+    normalized = re.sub(
+        r"^(?:basic|good|strong|solid|understanding of|knowledge of|familiarity with|experience with)\s+",
+        "",
+        normalized,
+    )
+    normalized = re.sub(r"\s+(?:knowledge|skills?|experience|exposure)$", "", normalized).strip()
+    canonical = {
+        "manual testing": "Manual Testing",
+        "manual testing process": "Manual Testing",
+        "manual testing processes": "Manual Testing",
+        "api testing": "API Testing",
+        "software development lifecycle (sdlc)": "SDLC",
+        "software development lifecycle": "SDLC",
+        "sdlc understanding": "SDLC",
+        "software testing concept": "Software Testing",
+        "software testing concepts": "Software Testing",
+        "api testing using postman": "Postman",
+        "project management tools (jira": "Jira",
+        "automation testing knowledge is a plus": "Automation Testing",
+        "ability to read english technical documents": "English Technical Reading",
+        "uat testing": "UAT Testing",
+        "os": "Operating Systems",
+        "networking": "Networking Fundamentals",
+        "ticket systems": "Ticketing Systems",
+        "ticket system": "Ticketing Systems",
+        "azure fundamentals": "Azure Fundamentals",
+        "troubleshooting": "Troubleshooting",
+        "microsoft cloud": "Microsoft Cloud",
+        "scripting": "Scripting",
+        "analyze data": "Data Analysis",
+        "analyse data": "Data Analysis",
+        "data analysis": "Data Analysis",
+        "build reports": "Reporting",
+        "build report": "Reporting",
+        "dashboards": "Dashboards",
+        "dashboard": "Dashboards",
+    }
+    return canonical.get(normalized, text)
+
+
+def _noise_skill_name(name: str) -> bool:
+    key = _skill_key(name)
+    normalized = _strip_accents(name).lower().strip()
+    return key in {"must", "musthave", "nice", "nicetohave", "preferredskills", "etc", "etc."} or bool(
+        re.fullmatch(r"(?:type|confidence|evidence|importance)\s*=.*", normalized)
+    )
+
+
+def _soft_skill_name(name: str) -> str:
+    normalized = _strip_accents(name).lower()
+    patterns = {
+        "Communication": r"\bcommunication\b",
+        "Teamwork": r"\bteamwork\b",
+        "Self-learning": r"\bself[- ]learning\b",
+        "Logical Thinking": r"\blogical thinking\b",
+        "Attention to Detail": r"\battention to detail\b",
+        "Carefulness": r"\bcareful\b",
+        "Detail-oriented": r"\bdetail[- ]oriented\b",
+        "Responsibility": r"\bresponsib(?:le|ility)\b",
+        "Proactiveness": r"\bproactive(?:ness)?\b",
+        "Accuracy": r"\baccuracy\b",
+        "Clear Result Presentation": r"\bclear\s+result\s+presentation\b",
+        "Creativity": r"\bcreative\b",
+        "UI/UX Attention": r"\bui/ux\s+attention\b",
+        "English Reading": r"\benglish\s+reading\b",
+    }
+    for canonical, pattern in patterns.items():
+        if re.search(pattern, normalized):
+            return canonical
+    return ""
+
+
+def _canonicalize_skill_rows(rows: List[Dict], *, job_title: str = "", drop_soft: bool = False) -> tuple[List[Dict], List[Dict]]:
+    skill_rows: List[Dict] = []
+    soft_rows: List[Dict] = []
+    for row in rows:
+        item = dict(row) if isinstance(row, dict) else {"name": row}
+        name = _clean_text(item.get("name"))
+        if not name or _noise_skill_name(name) or (job_title and _skill_key(name) == _skill_key(job_title)):
+            continue
+        soft_name = _soft_skill_name(name)
+        if soft_name:
+            soft_rows.append(_skill_row(soft_name, item.get("evidence", name), skill_type="soft"))
+            if drop_soft:
+                continue
+        item["name"] = _canonical_skill_name(name)
+        if item["name"] and not _noise_skill_name(item["name"]):
+            skill_rows.append(item)
+    return (
+        _clean_item_rows(skill_rows, ["name", "type", "confidence", "importance", "evidence"]),
+        _clean_item_rows(soft_rows, ["name", "type", "confidence", "evidence"]),
+    )
+
+
+def _fallback_skill_names_from_line(line: str) -> List[str]:
+    evidence = _strip_row_metadata(re.sub(r"^\s*[-*]\s*", "", line))
+    normalized = _strip_accents(evidence).lower()
+    if (
+        not evidence
+        or normalized in {"must", "must-have", "must have", "nice", "nice-to-have", "nice to have", "preferred skills"}
+        or normalized.startswith(("job title:", "we are ", "we're ", "about ", "overview "))
+        or normalized.startswith(("monitor ", "provide ", "support ", "maintain ", "handle ", "assist ", "participate ", "collaborate ", "identify ", "document ", "track ", "review ", "design and execute ", "perform "))
+        or re.search(r"\b(student|fresh graduate|degree|bachelor|master|phd|university|college|attitude)\b", normalized)
+    ):
+        return []
+
+    certification_codes = re.findall(r"\b[A-Z]{1,6}-\d{2,4}\b", evidence)
+    if certification_codes:
+        return [f"{code} Certification" for code in certification_codes]
+
+    text = re.sub(r"^(?:basic|good|strong|solid)\s+", "", evidence, flags=re.I)
+    text = re.sub(r"^(?:understanding of|knowledge of|familiarity with|experience with)\s+", "", text, flags=re.I)
+    text = re.sub(r"\s+(?:knowledge|skills?|exposure)$", "", text, flags=re.I).strip(" .")
+    names = []
+    for part in re.split(r"\s+(?:and|or)\s+|,", text, flags=re.I):
+        part = part.strip(" -.;:")
+        if not part:
+            continue
+        name = _canonical_skill_name(part)
+        if _soft_skill_name(name) or _noise_skill_name(name):
+            continue
+        names.append(name)
+    return _dedupe_skills(names)
+
+
+def _fallback_soft_skill_rows(lines: List[str]) -> List[Dict]:
+    rows = []
+    patterns = {
+        "Communication": r"\bcommunication\b",
+        "Teamwork": r"\bteamwork\b",
+        "Logical Thinking": r"\blogical thinking\b",
+        "Attention to Detail": r"\battention to detail\b",
+        "Responsibility": r"\bresponsib(?:le|ility)\b",
+        "Proactiveness": r"\bproactive(?:ness)?\b",
+    }
+    for line in lines:
+        evidence = _clean_text(re.sub(r"^\s*[-*]\s*", "", line))
+        normalized = _strip_accents(evidence).lower()
+        for soft_name, pattern in patterns.items():
+            if re.search(pattern, normalized):
+                rows.append(_skill_row(soft_name, evidence, skill_type="soft"))
+    return _clean_item_rows(rows, ["name", "type", "confidence", "evidence"])
+
+
+def _fallback_jd_skill_rows(text: str) -> tuple[List[Dict], List[Dict], List[Dict]]:
+    sections = _split_jd_text_by_headers(text)
+    required_lines = str(sections.get("requirements") or "").splitlines()
+    preferred_lines = str(sections.get("preferred_skills") or "").splitlines()
+    required_rows = [
+        _skill_row(name, line, skill_type="fallback")
+        for line in required_lines
+        for name in _fallback_skill_names_from_line(line)
+    ]
+    preferred_rows = [
+        _skill_row(name, line, skill_type="fallback")
+        for line in preferred_lines
+        for name in _fallback_skill_names_from_line(line)
+    ]
+    return (
+        _clean_item_rows(required_rows, ["name", "type", "confidence", "evidence"]),
+        _clean_item_rows(preferred_rows, ["name", "type", "confidence", "evidence"]),
+        _fallback_soft_skill_rows(required_lines + preferred_lines),
+    )
+
+
+def _requirement_importance(section: str, line: str) -> str:
+    normalized = _strip_accents(line).lower()
+    if section == "preferred_skills" or re.search(r"\b(preferred|nice[- ]?to[- ]?have|bonus|plus|ưu tiên|uu tien)\b", normalized):
+        return "preferred"
+    if section == "responsibilities":
+        return "responsibility"
+    return "required"
+
+
+def _requirement_category(section: str, line: str) -> str:
+    normalized = _strip_accents(line).lower()
+    if section == "soft_skills":
+        return "soft_skill"
+    if section == "responsibilities" or normalized.startswith(
+        (
+            "monitor ",
+            "provide ",
+            "support ",
+            "maintain ",
+            "handle ",
+            "assist ",
+            "participate ",
+            "collaborate ",
+            "identify ",
+            "document ",
+            "track ",
+            "review ",
+            "build ",
+            "integrate ",
+            "lead ",
+            "mentor ",
+            "analyze ",
+            "analyse ",
+        )
+    ):
+        return "responsibility"
+    if section == "experience" or re.search(r"\b(portfolio|project|internship|professional experience|work experience|years?|months?)\b", normalized):
+        return "experience"
+    if section == "education" or re.search(r"\b(student|fresh graduate|degree|bachelor|master|phd|university|college|computer science|engineering|related field)\b", normalized):
+        return "education"
+    if section == "benefits":
+        return "benefit"
+    if _soft_skill_name(line):
+        return "soft_skill"
+    if re.search(r"\b(certification|az-\d+|ms-\d+)\b", normalized):
+        return "certification"
+    if _fallback_skill_names_from_line(line):
+        return "skill"
+    return "responsibility" if len(line.split()) > 4 else "skill"
+
+
+def _unit_names_for_line(category: str, line: str) -> List[str]:
+    if category == "soft_skill":
+        names = []
+        for part in re.split(r",|\band\b", line, flags=re.I):
+            soft = _soft_skill_name(part)
+            if soft:
+                names.append(soft)
+        if names:
+            return _dedupe_skills(names)
+        return _dedupe_skills([_clean_text(part).title() for part in re.split(r",|\band\b", line, flags=re.I) if _clean_text(part)])
+    if category in {"skill", "certification"}:
+        return _fallback_skill_names_from_line(line) or [_canonical_skill_name(line)]
+    if category == "experience":
+        normalized = _strip_accents(line).lower()
+        if "project" in normalized or "portfolio" in normalized:
+            return ["Project Experience"]
+        if "professional experience" in normalized and "not required" in normalized:
+            return ["No Professional Experience Required"]
+        return [_clean_text(line)]
+    if category == "education":
+        return [_clean_text(line)]
+    if category == "responsibility":
+        return [_clean_text(line)]
+    return [_clean_text(line)]
+
+
+def _extract_requirement_units_from_text(text: str) -> List[Dict]:
+    sections = _split_jd_text_by_headers(text)
+    units: List[Dict] = []
+    seen = set()
+    for section, body in sections.items():
+        for line in _split_requirement_lines(body):
+            evidence = _clean_text(line)
+            if not evidence or _is_job_title_line(evidence) or not _line_in_text(evidence, text):
+                continue
+            category = _requirement_category(section, evidence)
+            importance = _requirement_importance(section, evidence)
+            unit_names = [(category, name) for name in _unit_names_for_line(category, evidence)]
+            if category == "soft_skill" and section != "soft_skills":
+                unit_names.extend(("skill", name) for name in _fallback_skill_names_from_line(evidence))
+            for unit_category, name in unit_names:
+                name = _clean_text(name)
+                if not name:
+                    continue
+                key = (unit_category, importance, _skill_key(name), _skill_key(evidence))
+                if key in seen:
+                    continue
+                seen.add(key)
+                units.append(
+                    {
+                        "name": name,
+                        "category": unit_category,
+                        "importance": importance,
+                        "source_section": section,
+                        "evidence": evidence,
+                        "confidence": "high",
+                    }
+                )
+    return units[:120]
+
+
+def _normalize_requirement_units(value, *, fallback_text: str = "") -> List[Dict]:
+    units: List[Dict] = []
+    seen = set()
+    for item in _as_list(value):
+        if not isinstance(item, dict):
+            continue
+        name = _strip_row_metadata(item.get("name") or item.get("normalized_name") or item.get("requirement"))
+        evidence = _clean_text(item.get("evidence") or item.get("raw_text") or name)
+        category = _clean_text(item.get("category")).lower() or "skill"
+        importance = _clean_text(item.get("importance")).lower() or "required"
+        source_section = _normalize_jd_section(item.get("source_section") or "")
+        if not name or not evidence or _is_job_title_line(name) or _is_job_title_line(evidence):
+            continue
+        if fallback_text and not _line_in_text(evidence, fallback_text):
+            continue
+        if category in {"technical_skill", "tool", "process", "domain"}:
+            category = "skill"
+        if category not in {"skill", "soft_skill", "responsibility", "experience", "education", "certification", "benefit"}:
+            category = _requirement_category(source_section, evidence)
+        if importance not in {"required", "preferred", "responsibility"}:
+            importance = _requirement_importance(source_section, evidence)
+        key = (category, importance, _skill_key(name), _skill_key(evidence))
+        if key in seen:
+            continue
+        seen.add(key)
+        units.append(
+            {
+                "name": name,
+                "category": category,
+                "importance": importance,
+                "source_section": source_section or "requirements",
+                "evidence": evidence,
+                "confidence": _clean_text(item.get("confidence")) or "medium",
+            }
+        )
+    for unit in _extract_requirement_units_from_text(fallback_text):
+        key = (unit["category"], unit["importance"], _skill_key(unit["name"]), _skill_key(unit["evidence"]))
+        if key not in seen:
+            units.append(unit)
+            seen.add(key)
+    return units[:120]
+
+
+def _skill_rows_from_requirement_units(units: List[Dict], importance: str) -> List[Dict]:
+    rows = []
+    for unit in units:
+        if unit.get("importance") != importance:
+            continue
+        if unit.get("category") not in {"skill", "certification"}:
+            continue
+        rows.append(
+            {
+                "name": _canonical_skill_name(unit.get("name")),
+                "type": "certification" if unit.get("category") == "certification" else "technical",
+                "confidence": unit.get("confidence", "medium"),
+                "importance": importance,
+                "evidence": unit.get("evidence", ""),
+            }
+        )
+    return _clean_item_rows(rows, ["name", "type", "confidence", "importance", "evidence"])
+
+
+def _soft_rows_from_requirement_units(units: List[Dict]) -> List[Dict]:
+    return _clean_item_rows(
+        [
+            {
+                "name": unit.get("name"),
+                "type": "soft",
+                "confidence": unit.get("confidence", "medium"),
+                "evidence": unit.get("evidence", ""),
+            }
+            for unit in units
+            if unit.get("category") == "soft_skill"
+        ],
+        ["name", "type", "confidence", "evidence"],
+    )
+
+
+def _responsibilities_from_requirement_units(units: List[Dict]) -> List[str]:
+    return list(
+        dict.fromkeys(
+            _clean_text(unit.get("evidence") or unit.get("name"))
+            for unit in units
+            if unit.get("category") == "responsibility" and _clean_text(unit.get("evidence") or unit.get("name"))
+        )
+    )[:30]
+
+
+def _skill_row_plausible(row: Dict, *, fallback_text: str = "") -> bool:
+    name = _clean_text(row.get("name"))
+    evidence = _clean_text(row.get("evidence")) or name
+    if not name or _is_job_title_line(name) or _is_job_title_line(evidence):
+        return False
+    if not fallback_text:
+        return True
+    category = _requirement_category(_normalize_jd_section(row.get("source_section") or ""), evidence)
+    if category in {"responsibility", "experience", "education", "benefit"}:
+        return False
+    return True
 
 
 DEFAULT_SCORING_CONFIG = {
@@ -272,6 +687,9 @@ def _infer_role(text: str) -> str:
         line = raw_line.strip(" #:-\t")
         if not line or line.startswith("[") or line.startswith("-"):
             continue
+        title_match = re.match(r"job\s+title\s*:\s*(.+)", line, re.I)
+        if title_match:
+            return _clean_text(title_match.group(1))
         if _normalize_jd_section(line) not in CANONICAL_SECTIONS and len(line) <= 100:
             return line
     return ""
@@ -330,21 +748,43 @@ def _normalize_jd_schema(data: Dict, *, fallback_text: str = "") -> Dict:
     fallback_education = _infer_education(fallback_text)
     fallback_experience = _infer_experience(fallback_text)
     role = _clean_text(context.get("role")) or _infer_role(fallback_text)
+    job_title = _clean_text(data.get("job_title")) or role
+    requirement_units = _normalize_requirement_units(data.get("requirement_units"), fallback_text=fallback_text)
+    required, required_soft = _canonicalize_skill_rows(required, job_title=job_title, drop_soft=True)
+    preferred, preferred_soft = _canonicalize_skill_rows(preferred, job_title=job_title, drop_soft=True)
+    required = [row for row in required if _skill_row_plausible(row, fallback_text=fallback_text)]
+    preferred = [row for row in preferred if _skill_row_plausible(row, fallback_text=fallback_text)]
+    unit_required = _skill_rows_from_requirement_units(requirement_units, "required")
+    unit_preferred = _skill_rows_from_requirement_units(requirement_units, "preferred")
+    unit_soft = _soft_rows_from_requirement_units(requirement_units)
+    unit_responsibilities = _responsibilities_from_requirement_units(requirement_units)
+    required = _clean_item_rows([*required, *unit_required], ["name", "type", "confidence", "importance", "evidence"])
+    preferred = _clean_item_rows([*preferred, *unit_preferred], ["name", "type", "confidence", "importance", "evidence"])
     
     # Extract overall confidence levels from the LLM response
     overall_confidence = data.get("_confidence", {})
     if not isinstance(overall_confidence, dict):
         overall_confidence = {}
 
+    raw_soft_rows = [] if unit_soft else _as_list(data.get("soft_skills"))
+
     schema = {
         "source_type": "jd",
-        "job_title": _clean_text(data.get("job_title")) or role,
+        "job_title": job_title,
         "required_skills": required[:60],
         "preferred_skills": preferred,
         "competencies": competencies,
-        "responsibilities": [_clean_text(x) for x in _as_list(data.get("responsibilities")) if _clean_text(x)][:30],
+        "responsibilities": list(
+            dict.fromkeys(
+                [*_responsibilities_from_requirement_units(requirement_units), *[_clean_text(x) for x in _as_list(data.get("responsibilities")) if _clean_text(x)]]
+            )
+        )[:30],
+        "requirement_units": requirement_units,
         "recruiter_expectations": _clean_expectations(data.get("recruiter_expectations")),
-        "soft_skills": _clean_item_rows(data.get("soft_skills"), ["name", "confidence", "evidence"]),
+        "soft_skills": _clean_item_rows(
+            [*raw_soft_rows, *required_soft, *preferred_soft, *unit_soft],
+            ["name", "type", "confidence", "evidence"],
+        ),
         "work_context": {
             "role": role,
             "seniority": _clean_text(context.get("seniority")).lower(),
@@ -500,7 +940,7 @@ def _schema_to_jd_sections(schema: Dict, *, fallback_text: str = "") -> Dict[str
     requirement_lines = []
     if title:
         requirement_lines.append(f"Job title: {title}")
-    requirement_lines.extend(_format_named_rows(schema.get("required_skills")))
+    requirement_lines.extend(_format_named_rows(schema.get("required_skills"), include_evidence=False))
     responsibilities = [_clean_text(x) for x in _as_list(schema.get("responsibilities")) if _clean_text(x)]
     if responsibilities:
         requirement_lines.append("Responsibilities:")
@@ -513,9 +953,9 @@ def _schema_to_jd_sections(schema: Dict, *, fallback_text: str = "") -> Dict[str
         sections["requirements"] = "\n".join(requirement_lines)
 
     skill_lines = []
-    required_skill_lines = _format_named_rows(schema.get("required_skills"))
-    preferred_skill_lines = _format_named_rows(schema.get("preferred_skills"))
-    competency_lines = _format_named_rows(schema.get("competencies"))
+    required_skill_lines = _format_named_rows(schema.get("required_skills"), include_evidence=False)
+    preferred_skill_lines = _format_named_rows(schema.get("preferred_skills"), include_evidence=False)
+    competency_lines = _format_named_rows(schema.get("competencies"), include_evidence=False)
     if required_skill_lines:
         skill_lines.append("Required skills:")
         skill_lines.extend(required_skill_lines)
@@ -556,7 +996,7 @@ def _schema_to_jd_sections(schema: Dict, *, fallback_text: str = "") -> Dict[str
     if education_lines:
         sections["education"] = "\n".join(education_lines)
 
-    soft_skill_lines = _format_named_rows(schema.get("soft_skills"))
+    soft_skill_lines = _format_named_rows(schema.get("soft_skills"), include_evidence=False)
     if soft_skill_lines:
         sections["soft_skills"] = "\n".join(soft_skill_lines)
 

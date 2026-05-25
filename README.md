@@ -1,133 +1,287 @@
-# 📄 SmartHire CV with RAG | AI-Powered Resume Analysis for Recruiters
+# SmartHire CV RAG Analyzer
 
-![image](https://github.com/user-attachments/assets/329d7314-e21d-4c18-a301-2515016fe893)
+SmartHire is a Streamlit prototype for CV analysis and JD-to-CV matching. It
+indexes uploaded PDF CVs, parses CV and JD schemas, retrieves candidate CV
+chunks with MongoDB Atlas Vector Search, reranks candidates with rule-based
+schema scoring, and shows matched skills, gaps, and supporting evidence.
 
+## Current Features
 
-## 📖 Introduction
+- Upload and index multiple CV PDFs.
+- Parse CV schema fields for candidate data, skills, projects, education, and
+  experience.
+- Audit stored CV extraction data with raw chunks, extracted skills, and schema
+  JSON in the app.
+- Index sample JDs or paste a new JD.
+- Match one JD against all indexed CVs or only CVs uploaded in the current
+  session.
+- Show score breakdown, matched skills, missing skills, and CV evidence.
+- Ask RAG questions about the selected CV.
 
-**SmartHire CV with RAG** is a next-gen AI tool that simplifies and accelerates resume screening. Upload a PDF CV and instantly extract structured data, generate summaries, and ask custom questions — all powered by a cutting-edge **Retrieval-Augmented Generation** pipeline with **AWS Bedrock embeddings**, **MongoDB vector search**, and **GPT-3.5**.
+## Current Runtime
 
-Whether you're a recruiter, HR manager, or talent specialist, **SmartHire CV** lets you assess candidates in seconds — without losing the context of the original CV. 🤖📄
+The current implementation uses:
 
----
+- Streamlit for the web UI.
+- MongoDB Atlas for CV chunks, candidate profiles, JD chunks, and vector search.
+- Ollama with the fixed model name `qwen2.5:1.5b` in `local_llm.py` for CV
+  schema parsing, JD schema parsing, and RAG answers.
+- A configurable embedding provider in `bedrock_utils.py`.
+  - Default: local `sentence-transformers/all-MiniLM-L6-v2`.
+  - Optional: AWS Bedrock embeddings.
+  - Optional: Google embeddings.
+- Optional cross-encoder reranking in `jd_matcher.py`.
+  - Default model: `cross-encoder/ms-marco-MiniLM-L-6-v2`.
+  - It scores raw JD text against raw CV chunks after vector retrieval.
+- Docling for PDF conversion and chunking, with a PyPDF2 text fallback.
 
-## 🚀 Features
+The project currently targets a local or controlled demo deployment. A public
+production deployment still needs authentication, monitoring, privacy controls,
+ and measured quality benchmarks.
 
-✔️ **One-Click Summary Table** – Auto-extracts Name, Role, Education, Experience, Skills, Certifications
-✔️ **RAG-Powered Q\&A** – Ask questions like “What tech stacks?” or “Would they fit a Product Owner role?”
-✔️ **AWS Bedrock Embeddings** – Uses **Titan-embed-text v2** for accurate semantic search
-✔️ **MongoDB Atlas `$vectorSearch`** – High-speed vector retrieval at scale
-✔️ **Concise GPT Responses** – Prompts begin with *"Please answer concisely..."* to ensure brief, focused output
-✔️ **Multi-CV Management** – Upload, index, choose, and delete multiple resumes
-✔️ **Streamlit Web UI** – Clean, no-code interface for non-technical users
+## Project Pipeline
 
----
+```text
+CV PDF
+  -> PDF conversion
+  -> CV schema extraction
+  -> CV chunking
+  -> chunk embeddings
+  -> MongoDB cv_chunks + candidates_profile
 
-## 🏗️ Technologies
+JD text
+  -> JD schema extraction
+  -> JD section chunks
+  -> JD embeddings
+  -> MongoDB job_descriptions
 
-* 🐍 **Python 3.12** – Backend and orchestration
-* 🌐 **Streamlit** – Lightweight frontend
-* 🔍 **LangChain** – RAG pipeline management
-* 🧠 **OpenAI GPT-3.5** – LLM for Q\&A and summarization
-* 🧆 **AWS Bedrock** – Embedding via Titan model
-* 📂 **MongoDB Atlas** – Vector DB for resume chunks
-* 📄 **PyMuPDF (fitz)** – PDF parsing and text extraction
-* 🔐 **python-dotenv** – Environment variable handling
+Matching request
+  -> JD vector retrieval over CV chunks
+  -> schema scoring for each candidate CV
+  -> hard filters
+  -> rerank
+  -> top K CVs with evidence
+```
 
----
+## Prerequisites
 
-## 📦 Installation
-
-### 1️⃣ Clone the Repository
+- Python 3.12 or a compatible tested Python environment.
+- MongoDB Atlas cluster with Vector Search available.
+- Ollama installed and running for the current local LLM path.
+- The Ollama model used by the code:
 
 ```bash
-git clone https://github.com/Yacine-Mekideche/cv-smart-hire.git
-cd cv-smart-hire
+ollama pull qwen2.5:1.5b
 ```
 
-### 2️⃣ Create a `.env` File
+## Setup
 
-```env
-OPENAI_API_KEY=your_openai_api_key
-MONGO_URI=your_mongodb_connection_string
-AWS_PROFILE=your_aws_profile
-AWS_REGION=your_aws_region
-```
-
-### 3️⃣ Set Up Your Environment
+1. Create a virtual environment.
 
 ```bash
 python -m venv venv
-# Activate:
-venv\Scripts\activate        # Windows
-source venv/bin/activate     # macOS/Linux
 ```
 
-### 4️⃣ Install Dependencies
+2. Activate it.
+
+Windows PowerShell:
+
+```powershell
+.\venv\Scripts\Activate.ps1
+```
+
+macOS/Linux:
+
+```bash
+source venv/bin/activate
+```
+
+3. Install Python dependencies.
 
 ```bash
 pip install -r requirements.txt
 ```
 
----
+4. Create a local environment file from the safe template.
 
-## ▶️ Running the App
+Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+macOS/Linux:
+
+```bash
+cp .env.example .env
+```
+
+5. Fill `.env` locally. Never commit `.env`.
+
+Minimum local setting:
+
+```env
+MONGO_URI=your_mongodb_atlas_connection_string
+EMBEDDING_PROVIDER=local
+```
+
+## Embedding Provider Notes
+
+The default local embedding configuration in `.env.example` uses 384
+dimensions. If `LOCAL_EMBED_LOCAL_FILES_ONLY=true`, the sentence-transformer
+model must already be present in the local model cache. For a first-time local
+download, set `LOCAL_EMBED_LOCAL_FILES_ONLY=false` temporarily or use Bedrock
+or Google embeddings instead.
+
+If you change embedding provider or model, create MongoDB vector indexes with a
+matching vector dimension before indexing CVs and JDs.
+
+## Cross-Encoder Reranking
+
+The matcher can optionally rerank candidates with a cross-encoder. This step
+does not replace schema scoring. It reads the JD text and the most relevant raw
+CV chunks, then contributes to the final rerank score.
+
+The same cross-encoder path can also refine matched and missing requirements.
+For each JD requirement, the matcher finds candidate evidence in raw CV chunks,
+scores the requirement/evidence pair, and stores the result in
+`requirement_match_details` for the dashboard.
+
+Default settings:
+
+```env
+CROSS_ENCODER_ENABLED=true
+CROSS_ENCODER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+CROSS_ENCODER_LOCAL_FILES_ONLY=true
+CROSS_ENCODER_MAX_CHUNKS=6
+CROSS_ENCODER_TOP_AVG=3
+CROSS_ENCODER_WEIGHT=0.25
+REQUIREMENT_EVIDENCE_ENABLED=true
+REQUIREMENT_EVIDENCE_THRESHOLD=0.55
+REQUIREMENT_EVIDENCE_MAX_REQUIREMENTS=18
+REQUIREMENT_EVIDENCE_MAX_CHUNKS=4
+```
+
+If the model is not available in the local cache and
+`CROSS_ENCODER_LOCAL_FILES_ONLY=true`, the app logs a warning and continues with
+the existing schema plus RAG rerank path. For first-time model download, set
+`CROSS_ENCODER_LOCAL_FILES_ONLY=false` temporarily in a network-enabled
+environment.
+
+## MongoDB Collections
+
+The app uses database `aws_rag_db` and these collections:
+
+| Collection | Purpose |
+| --- | --- |
+| `cv_chunks` | Raw CV chunks and CV chunk embeddings |
+| `candidates_profile` | One profile document and `cv_schema` per CV |
+| `job_descriptions` | JD chunks, JD schema, and JD embeddings |
+
+## MongoDB Atlas Vector Indexes
+
+The default local embedding model uses 384 dimensions. Create these Atlas Vector
+Search indexes before matching. Use the Atlas UI JSON editor or an equivalent
+Atlas-supported index creation path.
+
+### CV chunk vector index
+
+Collection:
+
+```text
+aws_rag_db.cv_chunks
+```
+
+Index name:
+
+```text
+vector_index
+```
+
+Definition:
+
+```json
+{
+  "fields": [
+    {
+      "type": "vector",
+      "path": "vector_embedding",
+      "numDimensions": 384,
+      "similarity": "cosine"
+    }
+  ]
+}
+```
+
+### JD vector index
+
+Collection:
+
+```text
+aws_rag_db.job_descriptions
+```
+
+Index name:
+
+```text
+jd_vector_index
+```
+
+Definition:
+
+```json
+{
+  "fields": [
+    {
+      "type": "vector",
+      "path": "embedding",
+      "numDimensions": 384,
+      "similarity": "cosine"
+    }
+  ]
+}
+```
+
+## Run
+
+Start Ollama first, then run the app:
 
 ```bash
 streamlit run app.py
 ```
 
-Once launched in your browser, you can:
+Inside the app:
 
-* 📄 Upload one or more PDF resumes
-* ⚙️ Click *“Index CV”* to generate embeddings and store in MongoDB
-* 📋 Select a CV and click *“Generate Full Profile”*
-* 🗨️ Ask free-form questions in the **Chat with CV** panel
+1. Upload one or more PDF CVs in the sidebar.
+2. Select a CV to inspect or chat with.
+3. Open `CV Extraction Audit` to review stored raw chunks and extracted schema.
+4. Index sample JDs or paste a JD.
+5. Run JD-to-CV matching and review candidate ranking.
 
----
+## Verification
 
-## 🎯 Demo
+Focused matcher tests:
 
-<a href="https://www.youtube.com/watch?v=-OoxQoQX86s" target="_blank">
-  <img src="https://img.youtube.com/vi/-OoxQoQX86s/maxresdefault.jpg" alt="SmartHire CV Demo" style="max-width:100%; height:auto;">
-</a>
-
----
-
-## 🧠 AI Architecture Overview
-
-```
-PDF Resume Upload
-       ↓
-Parsing & Chunking (PyMuPDF)
-       ↓
-Embeddings
- • AWS Bedrock (Titan-embed-text v2)
- • OpenAI (fallback)
-       ↓
-Vector Store (MongoDB Atlas)
-       ↓
-RAG Pipeline (LangChain)
-       ↓
-GPT-3.5 Inference
-       ↓
-Streamlit UI (Summary + Chat)
+```bash
+python -m unittest tests.test_jd_matcher_pipeline
 ```
 
----
+Syntax check for the Streamlit app:
 
-## 📬 Contact Me
+```bash
+python -m py_compile app.py
+```
 
-💡 **Transform your hiring pipeline with AI-powered CV insights.**
+## Deployment Notes
 
-[![Website](https://img.shields.io/badge/My%20Website-%23000000.svg?style=for-the-badge\&logo=About.me\&logoColor=white)](https://iacine.tech)
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-%230077B5.svg?style=for-the-badge\&logo=linkedin\&logoColor=white)](https://www.linkedin.com/in/yacine-mekideche/)
-[![GitHub](https://img.shields.io/badge/GitHub-%2312100E.svg?style=for-the-badge\&logo=github\&logoColor=white)](https://github.com/Yacine-Mekideche)
-[![Malt](https://img.shields.io/badge/Malt-%23FF6F61.svg?style=for-the-badge\&logo=malt\&logoColor=white)](https://malt.fr/profile/yacinemekideche)
-[![YouTube](https://img.shields.io/badge/YouTube-%23FF0000.svg?style=for-the-badge\&logo=youtube\&logoColor=white)](https://www.youtube.com/@iacine_tech)
+For a demo deployment, prepare:
 
-📩 **Business inquiries:** [contact@iacine.tech](mailto:contact@iacine.tech)
+- Environment variables or platform secrets instead of a committed `.env`.
+- Ollama runtime and model availability, or a deliberate code change to use a
+  hosted LLM provider.
+- MongoDB Atlas network access, collections, and vector indexes.
+- Enough memory for Docling and the selected local embedding/LLM path.
 
----
-
-**#SmartHire #ResumeAI #RAG #GPT #AWSBedrock #MongoDBAtlas #LangChain #Streamlit #RecruitmentTech #AIforHR #CVAnalysis #PythonProject #YacineTech #FreelanceAI**
+For production work, add authentication, authorization, logging, monitoring,
+CV data retention rules, secret rotation practices, evaluation benchmarks, and
+error reporting for MongoDB, LLM, and embedding failures.

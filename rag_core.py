@@ -5,7 +5,13 @@ import logging
 from bedrock_utils import get_embedding
 from local_llm import generate_answer
 from mongo_utils import insert_chunks, make_unique_source_name, search_similar_chunks, upsert_candidate_profile
-from pdf_utils import convert_cv_pdf, cv_document_to_chunks, cv_markdown_to_chunks, extract_cv_schema
+from pdf_utils import (
+    convert_cv_pdf,
+    cv_document_to_chunks,
+    cv_markdown_to_chunks,
+    extract_cv_schema,
+    reconcile_cv_schema_with_chunks,
+)
 
 
 logging.basicConfig(
@@ -95,6 +101,8 @@ def process_cv(file_path: str) -> dict:
     schema = extract_cv_schema(markdown_text)
     schema.setdefault("candidate", {})["cv_id"] = cv_id
     chunks = cv_document_to_chunks(doc, schema) if doc is not None else cv_markdown_to_chunks(markdown_text, schema)
+    schema = reconcile_cv_schema_with_chunks(schema, chunks)
+    schema.setdefault("candidate", {})["cv_id"] = cv_id
 
     index_cv(cv_id, schema, markdown_text, file_hash=file_hash, original_filename=path.name, chunks=chunks)
     return schema
@@ -109,6 +117,8 @@ def process_cv_bytes(pdf_bytes: bytes, filename: str) -> tuple[dict, int, str]:
     schema = extract_cv_schema(markdown_text)
     schema.setdefault("candidate", {})["cv_id"] = cv_id
     chunks = cv_document_to_chunks(doc, schema) if doc is not None else cv_markdown_to_chunks(markdown_text, schema)
+    schema = reconcile_cv_schema_with_chunks(schema, chunks)
+    schema.setdefault("candidate", {})["cv_id"] = cv_id
     count = index_cv(cv_id, schema, markdown_text, file_hash=file_hash, original_filename=filename, chunks=chunks)
     return schema, count, cv_id
 

@@ -1,14 +1,24 @@
-streamlit
-boto3
-pymongo
-PyPDF2
-python-dotenv
-openai
-PyMuPDF
-elevenlabs
-pydub
-ffmpeg
-langchain-aws
-langchain-chroma
-langchain-core
-langchain-ollama
+# Web app and data display
+streamlit==1.45.1
+pandas==2.2.3
+
+# Storage and configuration
+certifi==2026.2.25
+pymongo==4.16.0
+python-dotenv==1.1.0
+
+# CV parsing and schema validation
+docling==2.90.0
+PyPDF2==3.0.1
+pydantic==2.12.5
+
+# Current local LLM runtime
+ollama==0.6.1
+
+# Embedding providers
+sentence-transformers==5.4.0
+boto3==1.42.86
+langchain-google-genai==4.2.2
+
+# Optional alternative LLM module kept in openai_llm.py
+openai==1.109.1
