@@ -3,15 +3,15 @@ import hashlib
 import logging
 
 from bedrock_utils import get_embedding
-from local_llm import generate_answer
+from llm_provider import generate_answer
 from mongo_utils import insert_chunks, make_unique_source_name, search_similar_chunks, upsert_candidate_profile
 from pdf_utils import (
     convert_cv_pdf,
     cv_document_to_chunks,
     cv_markdown_to_chunks,
     extract_cv_schema,
-    reconcile_cv_schema_with_chunks,
 )
+
 
 
 logging.basicConfig(
@@ -65,13 +65,12 @@ def _embed_chunks(chunks: list, filename: str) -> list[tuple[str, list, dict]]:
 def index_cv(
     cv_id: str,
     schema: dict,
-    markdown_text: str,
     *,
     file_hash: str = None,
     original_filename: str = None,
-    chunks: list | None = None,
+    chunks: list,
+    storage_metadata: dict | None = None,
 ) -> int:
-    chunks = chunks or cv_markdown_to_chunks(markdown_text, schema)
     log.info("Raw vector chunks for '%s': %d", cv_id, len(chunks))
 
     upsert_candidate_profile(
@@ -79,6 +78,7 @@ def index_cv(
         schema,
         file_hash=file_hash,
         original_filename=original_filename,
+        extra_metadata=storage_metadata,
     )
     embedded = _embed_chunks(chunks, original_filename or cv_id)
     insert_chunks(
@@ -86,6 +86,7 @@ def index_cv(
         source_name=cv_id,
         file_hash=file_hash,
         original_filename=original_filename,
+        extra_metadata=storage_metadata,
     )
     return len(embedded)
 
@@ -98,28 +99,44 @@ def process_cv(file_path: str) -> dict:
 
     doc, markdown_text = convert_cv_pdf(path)
 
-    schema = extract_cv_schema(markdown_text)
-    schema.setdefault("candidate", {})["cv_id"] = cv_id
-    chunks = cv_document_to_chunks(doc, schema) if doc is not None else cv_markdown_to_chunks(markdown_text, schema)
-    schema = reconcile_cv_schema_with_chunks(schema, chunks)
+    chunks = (
+        cv_document_to_chunks(doc, markdown_text=markdown_text)
+        if doc is not None
+        else cv_markdown_to_chunks(markdown_text, {})
+    )
+    schema = extract_cv_schema(markdown_text, chunks=chunks)
+    # reconcile_cv_schema_with_chunks removed because function no longer exists in pdf_utils.py
+    # CV schema is already normalized via extract_cv_schema().
     schema.setdefault("candidate", {})["cv_id"] = cv_id
 
-    index_cv(cv_id, schema, markdown_text, file_hash=file_hash, original_filename=path.name, chunks=chunks)
+
+    index_cv(cv_id, schema, file_hash=file_hash, original_filename=path.name, chunks=chunks)
     return schema
 
 
-def process_cv_bytes(pdf_bytes: bytes, filename: str) -> tuple[dict, int, str]:
+def process_cv_bytes(pdf_bytes: bytes, filename: str, *, storage_metadata: dict | None = None) -> tuple[dict, int, str]:
     file_hash = hashlib.sha256(pdf_bytes).hexdigest()
     cv_id = make_unique_source_name(filename, file_hash)
 
     doc, markdown_text = convert_cv_pdf(pdf_bytes)
 
-    schema = extract_cv_schema(markdown_text)
+    chunks = (
+        cv_document_to_chunks(doc, markdown_text=markdown_text)
+        if doc is not None
+        else cv_markdown_to_chunks(markdown_text, {})
+    )
+    schema = extract_cv_schema(markdown_text, chunks=chunks)
+    # reconcile_cv_schema_with_chunks removed because function no longer exists in pdf_utils.py
     schema.setdefault("candidate", {})["cv_id"] = cv_id
-    chunks = cv_document_to_chunks(doc, schema) if doc is not None else cv_markdown_to_chunks(markdown_text, schema)
-    schema = reconcile_cv_schema_with_chunks(schema, chunks)
-    schema.setdefault("candidate", {})["cv_id"] = cv_id
-    count = index_cv(cv_id, schema, markdown_text, file_hash=file_hash, original_filename=filename, chunks=chunks)
+
+    count = index_cv(
+        cv_id,
+        schema,
+        file_hash=file_hash,
+        original_filename=filename,
+        chunks=chunks,
+        storage_metadata=storage_metadata,
+    )
     return schema, count, cv_id
 
 
@@ -128,7 +145,15 @@ def process_pdf_and_store(pdf_bytes: bytes, filename: str) -> int:
     return count
 
 
-def process_multiple_pdfs(file_list) -> tuple[int, list[str]]:
+def process_multiple_pdfs(
+    file_list,
+    *,
+    store_originals_to_s3: bool = False,
+    extra_metadata: dict | None = None,
+) -> tuple[int, list[str]]:
+    if store_originals_to_s3:
+        from s3_utils import upload_cv_pdf_to_s3
+
     log.info("Processing %d files", len(file_list))
     uploaded_sources: list[str] = []
     total = 0
@@ -136,7 +161,17 @@ def process_multiple_pdfs(file_list) -> tuple[int, list[str]]:
     for idx, file in enumerate(file_list, 1):
         log.info("File %d/%d: %s", idx, len(file_list), file.name)
         pdf_bytes = file.read()
-        _, count, source_name = process_cv_bytes(pdf_bytes, file.name)
+        file_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        storage_metadata = None
+        if store_originals_to_s3:
+            storage_metadata = upload_cv_pdf_to_s3(pdf_bytes, file.name, file_hash=file_hash)
+        if isinstance(extra_metadata, dict):
+            storage_metadata = {**(storage_metadata or {}), **extra_metadata}
+        _, count, source_name = process_cv_bytes(
+            pdf_bytes,
+            file.name,
+            storage_metadata=storage_metadata,
+        )
         total += count
         uploaded_sources.append(source_name)
 
