@@ -34,6 +34,174 @@ SECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 # ---------------------------------------------------------------------------
+# Text and type helpers
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class NormalizedText:
+    raw: str
+    clean: str
+
+
+def simple_clean(text: Any) -> str:
+    text = html.unescape(str(text or ""))
+    # Fix spaced uppercase acronyms: "H T M L" → "HTML"
+    text = re.sub(r"\b(?:[A-Z]\s){3,}[A-Z]\b", lambda m: m.group(0).replace(" ", ""), text)
+    text = text.replace("\ufeff", "")
+    text = re.sub(r"<!--\s*(?:image|picture|photo|avatar)\s*-->", "", text, flags=re.I)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+clean_text = simple_clean
+
+
+def normalize_text(raw: Any) -> NormalizedText:
+    return raw if isinstance(raw, NormalizedText) else NormalizedText(raw=str(raw or ""), clean=simple_clean(raw))
+
+
+def _clean_value(value: Any) -> str:
+    return value.clean if isinstance(value, NormalizedText) else simple_clean(value)
+
+
+def _clip(text: str | NormalizedText, limit: int) -> str:
+    text = _clean_value(text)
+    return text if len(text) <= limit else simple_clean(text[:limit])
+
+
+def _as_list(value: Any) -> List[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        m = re.search(r"\d+(?:\.\d+)?", value)
+        if m:
+            return float(m.group(0))
+    return default
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    return max(0, int(round(_to_float(value, default))))
+
+
+def _normalize_enum(value: Any, allowed: set[str]) -> str:
+    v = str(value or "").strip().lower()
+    return v if v in allowed else ""
+
+
+def _score_100(value: Any) -> int:
+    return int(round(max(0.0, min(100.0, _to_float(value, 0.0)))))
+
+
+def _normalize_confidence(value: Any) -> str:
+    if isinstance(value, str):
+        v = value.lower().strip()
+        if v in ("high", "medium", "low"):
+            return v
+    if isinstance(value, (int, float)):
+        if value >= 0.7:
+            return "high"
+        if value >= 0.4:
+            return "medium"
+        return "low"
+    return "medium"
+
+
+def _dedupe_strings(items: List[str], limit: int = 80) -> List[str]:
+    seen: set[str] = set()
+    result: List[str] = []
+    for item in items:
+        item = simple_clean(item)
+        key = item.lower()
+        if item and key not in seen:
+            result.append(item)
+            seen.add(key)
+    return result[:limit]
+
+
+def _clean_required(value: Any) -> str:
+    return simple_clean(value)
+
+
+def _clean_optional(value: Any) -> str | None:
+    return simple_clean(value) or None
+
+
+def _chunk_ids(value: Any) -> List[str]:
+    return _dedupe_strings([str(x) for x in _as_list(value)], limit=30)
+
+
+def _positive_float(value: Any) -> float | None:
+    value = _to_float(value, 0.0)
+    return value if value > 0 else None
+
+
+def _rounded_years(value: Any) -> float:
+    return round(_to_float(value, 0.0), 2)
+
+
+def _months(value: Any) -> int:
+    return _to_int(value, 0)
+
+
+def _dict_or_empty(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _dict_list(value: Any) -> List[Dict[str, Any]]:
+    return [item for item in _as_list(value) if isinstance(item, dict)]
+
+
+def _education_level(value: Any) -> str | None:
+    return _normalize_enum(value, EDUCATION_LEVELS) or None
+
+
+def _education_status(value: Any) -> str | None:
+    return _normalize_enum(value, {"", "completed", "in_progress"}) or None
+
+
+def _skill_type(value: Any) -> str:
+    return _normalize_enum(value, SKILL_TYPES)
+
+
+def _source_type(value: Any) -> str:
+    return simple_clean(value) or "cv"
+
+
+def _technologies(value: Any) -> List[str]:
+    return _dedupe_strings([str(x) for x in _as_list(value)], limit=30)
+
+
+def _filter_skills(rows: list[Any]) -> list[Any]:
+    return [row for row in rows if row.name and row.confidence != "low" and row.evidence and row.source_chunk_ids][:100]
+
+
+def _filter_soft_skills(rows: list[Any]) -> list[Any]:
+    return [row for row in rows if row.name and row.evidence and row.source_chunk_ids][:60]
+
+
+def _filter_languages(rows: list[Any]) -> list[Any]:
+    return [row for row in rows if row.name and row.evidence and row.source_chunk_ids][:30]
+
+
+def _filter_certifications(rows: list[Any]) -> list[Any]:
+    return [row for row in rows if (row.name or row.issuer) and row.evidence and row.source_chunk_ids][:30]
+
+
+def _filter_experience(rows: list[Any]) -> list[Any]:
+    return [row for row in rows if (row.title or row.company) and row.evidence and row.source_chunk_ids][:40]
+
+
+def _filter_projects(rows: list[Any]) -> list[Any]:
+    return [row for row in rows if (row.name or row.description or row.technologies) and row.evidence and row.source_chunk_ids][:40]
+
+
+# ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
 
@@ -44,10 +212,7 @@ class CandidateSchema(BaseModel):
     phone: str = ""
     location: str = ""
 
-    @field_validator("name", "email", "phone", "location", mode="before")
-    @classmethod
-    def _clean(cls, v: Any) -> str:
-        return simple_clean(v)
+    _clean = field_validator("name", "email", "phone", "location", mode="before")(_clean_required)
 
 class MetadataFilterSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -55,21 +220,9 @@ class MetadataFilterSchema(BaseModel):
     exp_years_min: Optional[float] = None
     location: Optional[str] = None
 
-    @field_validator("education_min", mode="before")
-    @classmethod
-    def _education(cls, v: Any) -> Optional[str]:
-        return _normalize_enum(v, EDUCATION_LEVELS) or None
-
-    @field_validator("location", mode="before")
-    @classmethod
-    def _location(cls, v: Any) -> Optional[str]:
-        return simple_clean(v) or None
-
-    @field_validator("exp_years_min", mode="before")
-    @classmethod
-    def _years(cls, v: Any) -> Optional[float]:
-        value = _to_float(v, 0.0)
-        return value if value > 0 else None
+    _education = field_validator("education_min", mode="before")(_education_level)
+    _location = field_validator("location", mode="before")(_clean_optional)
+    _years = field_validator("exp_years_min", mode="before")(_positive_float)
 
 class SkillSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -82,30 +235,11 @@ class SkillSchema(BaseModel):
     source_type: str = ""
     source_chunk_ids: List[str] = Field(default_factory=list)
 
-    @field_validator("confidence", mode="before")
-    @classmethod
-    def _norm(cls, v: Any) -> str:
-        return _normalize_confidence(v)
-
-    @field_validator("name", "evidence", "source_section", "source_type", mode="before")
-    @classmethod
-    def _clean(cls, v: Any) -> str:
-        return simple_clean(v)
-
-    @field_validator("type", mode="before")
-    @classmethod
-    def _type(cls, v: Any) -> str:
-        return _normalize_enum(v, SKILL_TYPES)
-
-    @field_validator("years", mode="before")
-    @classmethod
-    def _years(cls, v: Any) -> float:
-        return round(_to_float(v, 0.0), 2)
-
-    @field_validator("source_chunk_ids", mode="before")
-    @classmethod
-    def _chunk_ids(cls, v: Any) -> List[str]:
-        return _dedupe_strings([str(x) for x in _as_list(v)], limit=30)
+    _norm = field_validator("confidence", mode="before")(_normalize_confidence)
+    _clean = field_validator("name", "evidence", "source_section", "source_type", mode="before")(_clean_required)
+    _type = field_validator("type", mode="before")(_skill_type)
+    _years = field_validator("years", mode="before")(_rounded_years)
+    _chunk_ids = field_validator("source_chunk_ids", mode="before")(_chunk_ids)
 
 class SoftSkillSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -114,20 +248,9 @@ class SoftSkillSchema(BaseModel):
     evidence: str = ""
     source_chunk_ids: List[str] = Field(default_factory=list)
 
-    @field_validator("confidence", mode="before")
-    @classmethod
-    def _norm(cls, v: Any) -> str:
-        return _normalize_confidence(v)
-
-    @field_validator("name", "evidence", mode="before")
-    @classmethod
-    def _clean(cls, v: Any) -> str:
-        return simple_clean(v)
-
-    @field_validator("source_chunk_ids", mode="before")
-    @classmethod
-    def _chunk_ids(cls, v: Any) -> List[str]:
-        return _dedupe_strings([str(x) for x in _as_list(v)], limit=30)
+    _norm = field_validator("confidence", mode="before")(_normalize_confidence)
+    _clean = field_validator("name", "evidence", mode="before")(_clean_required)
+    _chunk_ids = field_validator("source_chunk_ids", mode="before")(_chunk_ids)
 
 class LanguageSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -137,20 +260,9 @@ class LanguageSchema(BaseModel):
     evidence: str = ""
     source_chunk_ids: List[str] = Field(default_factory=list)
 
-    @field_validator("confidence", mode="before")
-    @classmethod
-    def _norm(cls, v: Any) -> str:
-        return _normalize_confidence(v)
-
-    @field_validator("name", "level", "evidence", mode="before")
-    @classmethod
-    def _clean(cls, v: Any) -> str:
-        return simple_clean(v)
-
-    @field_validator("source_chunk_ids", mode="before")
-    @classmethod
-    def _chunk_ids(cls, v: Any) -> List[str]:
-        return _dedupe_strings([str(x) for x in _as_list(v)], limit=30)
+    _norm = field_validator("confidence", mode="before")(_normalize_confidence)
+    _clean = field_validator("name", "level", "evidence", mode="before")(_clean_required)
+    _chunk_ids = field_validator("source_chunk_ids", mode="before")(_chunk_ids)
 
 class CertificationSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -159,15 +271,8 @@ class CertificationSchema(BaseModel):
     evidence: str = ""
     source_chunk_ids: List[str] = Field(default_factory=list)
 
-    @field_validator("name", "issuer", "evidence", mode="before")
-    @classmethod
-    def _clean(cls, v: Any) -> str:
-        return simple_clean(v)
-
-    @field_validator("source_chunk_ids", mode="before")
-    @classmethod
-    def _chunk_ids(cls, v: Any) -> List[str]:
-        return _dedupe_strings([str(x) for x in _as_list(v)], limit=30)
+    _clean = field_validator("name", "issuer", "evidence", mode="before")(_clean_required)
+    _chunk_ids = field_validator("source_chunk_ids", mode="before")(_chunk_ids)
 
 class EducationSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -178,25 +283,10 @@ class EducationSchema(BaseModel):
     evidence: Optional[str] = None
     source_chunk_ids: List[str] = Field(default_factory=list)
 
-    @field_validator("level", mode="before")
-    @classmethod
-    def _level(cls, v: Any) -> Optional[str]:
-        return _normalize_enum(v, EDUCATION_LEVELS) or None
-
-    @field_validator("status", mode="before")
-    @classmethod
-    def _status(cls, v: Any) -> Optional[str]:
-        return _normalize_enum(v, {"", "completed", "in_progress"}) or None
-
-    @field_validator("major", "school", "evidence", mode="before")
-    @classmethod
-    def _clean(cls, v: Any) -> Optional[str]:
-        return simple_clean(v) or None
-
-    @field_validator("source_chunk_ids", mode="before")
-    @classmethod
-    def _chunk_ids(cls, v: Any) -> List[str]:
-        return _dedupe_strings([str(x) for x in _as_list(v)], limit=30)
+    _level = field_validator("level", mode="before")(_education_level)
+    _status = field_validator("status", mode="before")(_education_status)
+    _clean = field_validator("major", "school", "evidence", mode="before")(_clean_optional)
+    _chunk_ids = field_validator("source_chunk_ids", mode="before")(_chunk_ids)
 
 class ExperienceSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -211,30 +301,11 @@ class ExperienceSchema(BaseModel):
     evidence: str = ""
     source_chunk_ids: List[str] = Field(default_factory=list)
 
-    @field_validator("title", "company", "start_date", "end_date", "domain", "evidence", mode="before")
-    @classmethod
-    def _clean(cls, v: Any) -> str:
-        return simple_clean(v)
-
-    @field_validator("years", mode="before")
-    @classmethod
-    def _years(cls, v: Any) -> float:
-        return round(_to_float(v, 0.0), 2)
-
-    @field_validator("months", mode="before")
-    @classmethod
-    def _months(cls, v: Any) -> int:
-        return _to_int(v, 0)
-
-    @field_validator("quality_score", mode="before")
-    @classmethod
-    def _quality(cls, v: Any) -> int:
-        return _score_100(v)
-
-    @field_validator("source_chunk_ids", mode="before")
-    @classmethod
-    def _chunk_ids(cls, v: Any) -> List[str]:
-        return _dedupe_strings([str(x) for x in _as_list(v)], limit=30)
+    _clean = field_validator("title", "company", "start_date", "end_date", "domain", "evidence", mode="before")(_clean_required)
+    _years = field_validator("years", mode="before")(_rounded_years)
+    _months = field_validator("months", mode="before")(_months)
+    _quality = field_validator("quality_score", mode="before")(_score_100)
+    _chunk_ids = field_validator("source_chunk_ids", mode="before")(_chunk_ids)
 
 class ProjectSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -245,35 +316,17 @@ class ProjectSchema(BaseModel):
     evidence: str = ""
     source_chunk_ids: List[str] = Field(default_factory=list)
 
-    @field_validator("name", "description", "evidence", mode="before")
-    @classmethod
-    def _clean(cls, v: Any) -> str:
-        return simple_clean(v)
-
-    @field_validator("technologies", mode="before")
-    @classmethod
-    def _technologies(cls, v: Any) -> List[str]:
-        return _dedupe_strings([str(x) for x in _as_list(v)], limit=30)
-
-    @field_validator("quality_score", mode="before")
-    @classmethod
-    def _quality(cls, v: Any) -> int:
-        return _score_100(v)
-
-    @field_validator("source_chunk_ids", mode="before")
-    @classmethod
-    def _chunk_ids(cls, v: Any) -> List[str]:
-        return _dedupe_strings([str(x) for x in _as_list(v)], limit=30)
+    _clean = field_validator("name", "description", "evidence", mode="before")(_clean_required)
+    _technologies = field_validator("technologies", mode="before")(_technologies)
+    _quality = field_validator("quality_score", mode="before")(_score_100)
+    _chunk_ids = field_validator("source_chunk_ids", mode="before")(_chunk_ids)
 
 class ConfidenceSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
     skills: str = "high"
     education_min: str = "medium"
 
-    @field_validator("skills", "education_min", mode="before")
-    @classmethod
-    def _norm(cls, v: Any) -> str:
-        return _normalize_confidence(v)
+    _norm = field_validator("skills", "education_min", mode="before")(_normalize_confidence)
 
 class CVStructuredSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -292,56 +345,17 @@ class CVStructuredSchema(BaseModel):
     projects: List[ProjectSchema] = Field(default_factory=list)
     confidence: ConfidenceSchema = Field(default_factory=ConfidenceSchema, alias="_confidence")
 
-    @field_validator("source_type", mode="before")
-    @classmethod
-    def _source_type(cls, v: Any) -> str:
-        return simple_clean(v) or "cv"
+    _source_type = field_validator("source_type", mode="before")(_source_type)
+    _object_or_empty = field_validator("candidate", "metadata_filter", "education", "confidence", mode="before")(_dict_or_empty)
+    _dict_list = field_validator("skills", "soft_skills", "languages", "certifications", "experience", "projects", mode="before")(_dict_list)
+    _total_years = field_validator("total_experience_years", mode="before")(_positive_float)
 
-    @field_validator("candidate", "metadata_filter", "education", "confidence", mode="before")
-    @classmethod
-    def _object_or_empty(cls, v: Any) -> Dict[str, Any]:
-        return v if isinstance(v, dict) else {}
-
-    @field_validator("skills", "soft_skills", "languages", "certifications", "experience", "projects", mode="before")
-    @classmethod
-    def _dict_list(cls, v: Any) -> List[Dict[str, Any]]:
-        return [item for item in _as_list(v) if isinstance(item, dict)]
-
-    @field_validator("total_experience_years", mode="before")
-    @classmethod
-    def _total_years(cls, v: Any) -> Optional[float]:
-        value = _to_float(v, 0.0)
-        return value if value > 0 else None
-
-    @field_validator("skills", mode="after")
-    @classmethod
-    def _skills(cls, v: List[SkillSchema]) -> List[SkillSchema]:
-        return [row for row in v if row.name and row.confidence != "low" and row.evidence and row.source_chunk_ids][:100]
-
-    @field_validator("soft_skills", mode="after")
-    @classmethod
-    def _soft_skills(cls, v: List[SoftSkillSchema]) -> List[SoftSkillSchema]:
-        return [row for row in v if row.name and row.evidence and row.source_chunk_ids][:60]
-
-    @field_validator("languages", mode="after")
-    @classmethod
-    def _languages(cls, v: List[LanguageSchema]) -> List[LanguageSchema]:
-        return [row for row in v if row.name and row.evidence and row.source_chunk_ids][:30]
-
-    @field_validator("certifications", mode="after")
-    @classmethod
-    def _certifications(cls, v: List[CertificationSchema]) -> List[CertificationSchema]:
-        return [row for row in v if (row.name or row.issuer) and row.evidence and row.source_chunk_ids][:30]
-
-    @field_validator("experience", mode="after")
-    @classmethod
-    def _experience(cls, v: List[ExperienceSchema]) -> List[ExperienceSchema]:
-        return [row for row in v if (row.title or row.company) and row.evidence and row.source_chunk_ids][:40]
-
-    @field_validator("projects", mode="after")
-    @classmethod
-    def _projects(cls, v: List[ProjectSchema]) -> List[ProjectSchema]:
-        return [row for row in v if (row.name or row.description or row.technologies) and row.evidence and row.source_chunk_ids][:40]
+    _skills = field_validator("skills", mode="after")(_filter_skills)
+    _soft_skills = field_validator("soft_skills", mode="after")(_filter_soft_skills)
+    _languages = field_validator("languages", mode="after")(_filter_languages)
+    _certifications = field_validator("certifications", mode="after")(_filter_certifications)
+    _experience = field_validator("experience", mode="after")(_filter_experience)
+    _projects = field_validator("projects", mode="after")(_filter_projects)
 
     @model_validator(mode="after")
     def _derive_experience(self) -> "CVStructuredSchema":
@@ -389,91 +403,6 @@ CV:
 SCHEMA:
 {schema_definition}
 """
-# ---------------------------------------------------------------------------
-# Text helpers
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class NormalizedText:
-    raw: str
-    clean: str
-
-
-def simple_clean(text: Any) -> str:
-    text = html.unescape(str(text or ""))
-    # Fix spaced uppercase acronyms: "H T M L" → "HTML"
-    text = re.sub(r"\b(?:[A-Z]\s){3,}[A-Z]\b", lambda m: m.group(0).replace(" ", ""), text)
-    text = text.replace("\ufeff", "")
-    text = re.sub(r"<!--\s*(?:image|picture|photo|avatar)\s*-->", "", text, flags=re.I)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n[ \t]+", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-clean_text = simple_clean
-
-
-def normalize_text(raw: Any) -> NormalizedText:
-    return raw if isinstance(raw, NormalizedText) else NormalizedText(raw=str(raw or ""), clean=simple_clean(raw))
-
-
-def _clean_value(value: Any) -> str:
-    return value.clean if isinstance(value, NormalizedText) else simple_clean(value)
-
-
-def _clip(text: str | NormalizedText, limit: int) -> str:
-    text = _clean_value(text)
-    return text if len(text) <= limit else simple_clean(text[:limit])
-
-# ---------------------------------------------------------------------------
-# Type coercion helpers
-# ---------------------------------------------------------------------------
-
-def _as_list(value: Any) -> List[Any]:
-    return value if isinstance(value, list) else []
-
-def _to_float(value: Any, default: float = 0.0) -> float:
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        m = re.search(r"\d+(?:\.\d+)?", value)
-        if m:
-            return float(m.group(0))
-    return default
-
-def _to_int(value: Any, default: int = 0) -> int:
-    return max(0, int(round(_to_float(value, default))))
-
-def _normalize_enum(value: Any, allowed: set[str]) -> str:
-    v = str(value or "").strip().lower()
-    return v if v in allowed else ""
-
-def _score_100(value: Any) -> int:
-    return int(round(max(0.0, min(100.0, _to_float(value, 0.0)))))
-
-def _normalize_confidence(value: Any) -> str:
-    if isinstance(value, str):
-        v = value.lower().strip()
-        if v in ("high", "medium", "low"):
-            return v
-    if isinstance(value, (int, float)):
-        if value >= 0.7: return "high"
-        if value >= 0.4: return "medium"
-        return "low"
-    return "medium"
-
-def _dedupe_strings(items: List[str], limit: int = 80) -> List[str]:
-    seen: set[str] = set()
-    result: List[str] = []
-    for item in items:
-        item = simple_clean(item)
-        key = item.lower()
-        if item and key not in seen:
-            result.append(item)
-            seen.add(key)
-    return result[:limit]
-
 # ---------------------------------------------------------------------------
 # PDF conversion
 # ---------------------------------------------------------------------------
