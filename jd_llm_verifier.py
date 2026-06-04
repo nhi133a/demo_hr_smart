@@ -55,11 +55,21 @@ CV evidence snippets:
 {chr(10).join(evidence_parts) if evidence_parts else "(no useful CV evidence)"}
 
 Rules:
-- Return matched=true only when the CV evidence demonstrates real experience, project work, coursework, or concrete usage.
-- Do not match when the CV only says the candidate is interested in learning something.
+- Match only when CV evidence shows practical capability through work, projects, study, certification, concrete usage, responsibility, or result.
+- Do not match from vague interest, willingness, keyword-only mentions, or unsupported claims.
 - Do not invent evidence outside the snippets.
-- Prefer semantic equivalence: "built HTTP JSON endpoints" can support "REST API Design"; "database schema/tables/relations" can support "Database Modeling".
-- Set confidence from 0.0 to 1.0. Use >=0.70 only when the evidence clearly supports the requirement.
+- Distinguish basic exposure from deeper capability:
+  - Mentioning a tool/technology proves only exposure or usage.
+  - Match design/ownership/leadership/analysis/strategy only when the CV shows related decisions, responsibility, outputs, or outcomes.
+  - For tool-specific requirements, require the exact tool or a direct equivalent.
+- Semantic matching is allowed when the evidence demonstrates the same practical capability using different wording.
+- For intern/fresher roles, academic or personal projects can be valid evidence.
+- For higher-level roles, require stronger evidence such as ownership, repeated use, impact, scale, or professional responsibility.
+- Set confidence from 0.0 to 1.0:
+  - High confidence for direct and explicit evidence.
+  - Medium confidence for practical but indirect evidence.
+  - Low confidence for vague, weak, or keyword-only evidence.
+- Return matched=true only when confidence meets the threshold.
 
 Return JSON only:
 {{

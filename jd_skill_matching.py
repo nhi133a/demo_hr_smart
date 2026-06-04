@@ -82,6 +82,82 @@ def _token_set(value: str) -> set[str]:
     return set(re.findall(r"[a-z0-9+#]+", _norm_text(value)))
 
 
+GENERIC_MATCH_TOKENS = {
+    "ability",
+    "basic",
+    "business",
+    "development",
+    "experience",
+    "good",
+    "knowledge",
+    "management",
+    "process",
+    "project",
+    "skill",
+    "skills",
+    "software",
+    "system",
+    "systems",
+    "technical",
+    "technology",
+    "tools",
+    "using",
+    "work",
+    "working",
+}
+
+
+def _important_tokens(value: str) -> set[str]:
+    return {token for token in _token_set(value) if len(token) > 2 and token not in GENERIC_MATCH_TOKENS}
+
+
+def _category_compatible(jd_row: Dict, cv_row: Dict) -> bool:
+    jd_category = str(_row_value(jd_row, "category") or _row_value(jd_row, "source") or "").lower()
+    cv_category = str(_row_value(cv_row, "category") or _row_value(cv_row, "source") or "").lower()
+    if not jd_category or not cv_category:
+        return True
+    if jd_category == cv_category:
+        return True
+    skill_categories = {"skill", "technical_skill", "project_technology", "certification", "required_skill", "preferred_skill"}
+    soft_categories = {"soft_skill", "competency"}
+    language_categories = {"language"}
+    return (
+        jd_category in skill_categories and cv_category in skill_categories
+        or jd_category in soft_categories and cv_category in soft_categories
+        or jd_category in language_categories and cv_category in language_categories
+    )
+
+
+def _capability_match(jd_row: Dict, cv_row: Dict) -> bool:
+    if not _category_compatible(jd_row, cv_row):
+        return False
+    name = _row_name(jd_row)
+    cv_name = _row_name(cv_row)
+    if _skills_match(name, cv_name):
+        return True
+
+    req_tokens = _important_tokens(name)
+    if not req_tokens:
+        return False
+    cv_text = " ".join(
+        str(_row_value(cv_row, key) or "")
+        for key in ("name", "evidence", "description", "source_section")
+    )
+    cv_tokens = _important_tokens(cv_text)
+    if not cv_tokens:
+        return False
+    if req_tokens <= cv_tokens:
+        return True
+
+    shared = req_tokens & cv_tokens
+    jd_category = str(_row_value(jd_row, "category") or _row_value(jd_row, "source") or "").lower()
+    cv_category = str(_row_value(cv_row, "category") or _row_value(cv_row, "source") or "").lower()
+    soft_categories = {"soft_skill", "competency"}
+    if jd_category in soft_categories and cv_category in soft_categories and shared:
+        return len(shared) / max(1, len(req_tokens)) >= 0.5
+    return False
+
+
 SKILL_TEXT_EVIDENCE = {
     "restapidesign": (
         r"\brest(?:ful)?\s+apis?\b",
@@ -214,7 +290,7 @@ def _match_rows(jd_rows: List[Dict], cv_rows: List[Dict], cv_text: str) -> tuple
 
     def row_match(row: Dict) -> Dict[str, str] | Dict | None:
         name = _row_name(row)
-        match = next((cv_row for cv_row in cv_rows if _skills_match(name, _row_name(cv_row))), None)
+        match = next((cv_row for cv_row in cv_rows if _capability_match(row, cv_row)), None)
         return match or _skill_text_match(name, cv_text)
 
     for jd_row in jd_rows:

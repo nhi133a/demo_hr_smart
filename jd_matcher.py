@@ -30,6 +30,7 @@ from jd_matcher_config import (
     REQUIREMENT_EVIDENCE_THRESHOLD,
 )
 from jd_skill_matching import (
+    _capability_match,
     _dedupe_keep_order,
     _match_rows,
     _row_name,
@@ -224,14 +225,91 @@ def _cv_text(chunks: List[Dict]) -> str:
     return "\n".join(str(ch.get("text") or ch.get("embedding_text") or ch.get("content") or "") for ch in chunks)
 
 
+def _tag_rows(rows: List[Dict], category: str) -> List[Dict]:
+    tagged = []
+    for row in rows:
+        item = dict(row)
+        item.setdefault("category", category)
+        tagged.append(item)
+    return tagged
+
+
+def _add_cv_capability(rows: List[Dict], item: Any, category: str, source: str, *, evidence: str = "") -> None:
+    if isinstance(item, str):
+        row = {"name": item}
+    elif isinstance(item, dict):
+        row = dict(item)
+    else:
+        return
+    name = str(row.get("name") or row.get("level") or row.get("domain") or row.get("title") or "").strip()
+    if not name:
+        return
+    row["name"] = name
+    row.setdefault("category", category)
+    row.setdefault("source", source)
+    if evidence and not row.get("evidence"):
+        row["evidence"] = evidence
+    rows.append(row)
+
+
+def _dedupe_rows(rows: List[Dict]) -> List[Dict]:
+    seen = set()
+    result = []
+    for row in rows:
+        key = (_skill_key(_row_name(row)), str(row.get("category") or ""))
+        if key[0] and key not in seen:
+            seen.add(key)
+            result.append(row)
+    return result
+
+
 def _cv_skill_rows(chunks: List[Dict], cv_schema: Dict) -> List[Dict]:
     rows = []
-    rows.extend(_rows(cv_schema, "skills_must"))
-    rows.extend(_rows(cv_schema, "skills_nice"))
-    rows.extend(_rows(cv_schema, "required_skills"))
-    rows.extend(_rows(cv_schema, "preferred_skills"))
+    for row in _rows(cv_schema, "skills"):
+        _add_cv_capability(rows, row, "skill", "cv_schema.skills")
+    for row in _rows(cv_schema, "soft_skills"):
+        _add_cv_capability(rows, row, "soft_skill", "cv_schema.soft_skills")
+    for row in _rows(cv_schema, "certifications"):
+        _add_cv_capability(rows, row, "certification", "cv_schema.certifications")
+    for row in _rows(cv_schema, "languages"):
+        _add_cv_capability(rows, row, "language", "cv_schema.languages")
+
+    for project in cv_schema.get("projects", []) if isinstance(cv_schema, dict) else []:
+        if not isinstance(project, dict):
+            continue
+        evidence = str(project.get("evidence") or project.get("description") or project.get("name") or "")
+        for tech in project.get("technologies", []) if isinstance(project.get("technologies"), list) else []:
+            _add_cv_capability(
+                rows,
+                {
+                    "name": tech,
+                    "evidence": evidence,
+                    "source_chunk_ids": project.get("source_chunk_ids") or [],
+                },
+                "project_technology",
+                "cv_schema.projects.technologies",
+            )
+
+    for exp in cv_schema.get("experience", []) if isinstance(cv_schema, dict) else []:
+        if not isinstance(exp, dict):
+            continue
+        evidence = str(exp.get("evidence") or "")
+        for key in ("domain", "title"):
+            _add_cv_capability(
+                rows,
+                {
+                    "name": exp.get(key),
+                    "evidence": evidence,
+                    "source_chunk_ids": exp.get("source_chunk_ids") or [],
+                },
+                "experience",
+                f"cv_schema.experience.{key}",
+            )
+
     if rows:
-        return rows
+        return _dedupe_rows(rows)
+
+
 
     fallback = []
     for chunk in chunks:
@@ -244,7 +322,7 @@ def _cv_skill_rows(chunks: List[Dict], cv_schema: Dict) -> List[Dict]:
         for line in str(chunk.get("skill_text") or "").splitlines():
             if line.strip().startswith("-"):
                 fallback.append(line.strip("- ").strip())
-    return [{"name": skill, "confidence": "medium"} for skill in _dedupe_keep_order(fallback)]
+    return [{"name": skill, "confidence": "medium", "category": "skill"} for skill in _dedupe_keep_order(fallback)]
 
 
 def extract_cv_profile(cv_chunks: List[Dict]) -> Dict[str, Any]:
@@ -519,7 +597,17 @@ def _requirement_evidence_matches(
     best_by_requirement: Dict[tuple[str, str], Dict] = {}
     for unit in units:
         name = str(unit.get("name") or "")
-        match_row = next((row for row in cv_rows if _skills_match(name, _row_name(row))), None)
+        match_row = next(
+            (
+                row
+                for row in cv_rows
+                if _capability_match(
+                    {"name": name, "category": str(unit.get("source") or "")},
+                    row,
+                )
+            ),
+            None,
+        )
         if not match_row:
             match_row = _skill_text_match(name, cv_text)
         if match_row:
@@ -777,9 +865,9 @@ def _score_candidate(jd_schema: Dict, jd_content: str, cv_chunks: List[Dict]) ->
     cv_rows = _cv_skill_rows(cv_chunks, cv_schema)
     cv_text = _cv_text(cv_chunks)
 
-    required_rows = _rows(jd_schema, "required_skills")
-    preferred_rows = _rows(jd_schema, "preferred_skills")
-    competency_rows = _rows(jd_schema, "competencies") + _rows(jd_schema, "soft_skills")
+    required_rows = _tag_rows(_rows(jd_schema, "required_skills"), "skill")
+    preferred_rows = _tag_rows(_rows(jd_schema, "preferred_skills"), "skill")
+    competency_rows = _tag_rows(_rows(jd_schema, "competencies"), "competency") + _tag_rows(_rows(jd_schema, "soft_skills"), "soft_skill")
 
     required_ratio, matched_required, missing_required, req_evidence = _match_rows(required_rows, cv_rows, cv_text)
     preferred_ratio, matched_preferred, missing_preferred, pref_evidence = _match_rows(preferred_rows, cv_rows, cv_text)
@@ -1089,9 +1177,11 @@ def match_jd_to_cvs(
     *,
     use_llm: bool = False,
     source_whitelist: List[str] | None = None,
+    applicants_only: bool = False,
 ) -> List[Dict]:
     from mongo_utils import (
         get_candidate_name,
+        get_candidate_profile,
         get_chunks_by_source_for_matching,
         get_distinct_sources,
         search_similar_cv_chunks,
@@ -1115,8 +1205,19 @@ def match_jd_to_cvs(
     if source_whitelist is not None:
         allowed = set(source_whitelist or [])
         all_sources = [source for source in all_sources if source in allowed]
+    if applicants_only:
+        scoped_sources = []
+        for source in all_sources:
+            profile = get_candidate_profile(source)
+            applied_ids = profile.get("applied_jd_ids")
+            if isinstance(applied_ids, str):
+                applied_ids = [applied_ids]
+            if profile.get("applied_jd_id") == jd_id or jd_id in (applied_ids or []):
+                scoped_sources.append(source)
+        all_sources = scoped_sources
     if not all_sources:
-        return _error_result(jd_id, jd_title, "No CVs available in the selected scope")
+        message = "No CVs applied to this JD" if applicants_only else "No CVs available in the selected scope"
+        return _error_result(jd_id, jd_title, message)
 
     filtered_sources, preloaded_chunks, rejected_sources = _prefilter_sources(
         jd_schema,
